@@ -47,6 +47,163 @@ from .linesearch_criterion import (
     LineSearchUnconstrainedArmijoCriterion,
 )
 
+@fem.integrand
+def defgrad(u: fem.Field, s: fem.Sample):
+    """
+    Computes the deformation gradient F = grad(u) + I, if no displacement then material is undeformed. 
+    """
+    return fem.grad(u, s) + wp.identity(n=3, dtype=float)
+
+
+@fem.integrand
+def defgrad_avg(u: fem.Field, s: fem.Sample):
+    """
+    Computes the average deformation gradient. This applies for discontinuous fields, where the 
+    field needs to be averaged across elements.
+    """
+    return fem.grad_average(u, s) + wp.identity(n=3, dtype=float)
+
+
+@fem.integrand
+def inertia_form(s: Sample, domain: Domain, u: Field, v: Field, rho: float, dt: float):
+    """
+    Defines the intertia form for the displacement field. 
+    <rho/dt^2 u, v>
+    
+    Args:
+        s: sample 
+        domain: domain to integrate over
+        u: displacement at sample s
+        v: test function at sample s
+        rho: density
+        dt: timestep
+
+    Returns:
+        The inertia form for the displacement field.
+    """
+
+    u_rhs = rho * u(s) / (dt * dt)
+    return wp.dot(u_rhs, v(s))
+
+
+@fem.integrand
+def dg_penalty_form(s: Sample, domain: Domain, u: Field, v: Field, k: float):
+    """
+    Defines the penalty for neighbouring elements. k is the penalty stiffness.
+    """
+    # compute the difference in u between the two sides of an element boundary
+    ju = fem.jump(u, s)
+    jv = fem.jump(v, s)
+
+    # scale the penalty
+    return wp.dot(ju, jv) * k * fem.measure_ratio(domain, s)
+
+
+@fem.integrand
+def displacement_rhs_form(
+    s: Sample,
+    domain: Domain,
+    u: Field,
+    u_prev: Field,
+    v: Field,
+    rho: float,
+    gravity: wp.vec3,
+    dt: float,
+):
+    """
+    Displacement right hand side form, it includes the intertia form and the gravity term. 
+    <rho/dt^2 u, v> + <rho g, v>
+    """
+    f = (
+        inertia_form(s, domain, u_prev, v, rho, dt) # intertia form for previous displacement
+        - inertia_form(s, domain, u, v, rho, dt) # current displacement
+        + rho * wp.dot(gravity, v(s)) # gravity term
+    )
+
+    return f
+
+
+@fem.integrand
+def kinetic_potential_energy(
+    s: Sample,
+    domain: Domain,
+    u: Field,
+    v: Field,
+    rho: float,
+    dt: float,
+    gravity: wp.vec3,
+):
+    """
+    Computes the kinetic potential energy for the displacement field.
+
+    Args:
+        s: sample
+        domain: domain to integrate over
+        u: displacement at sample s
+        v: previous displacement at sample s
+        rho: density
+        dt: timestep
+        gravity: gravity
+
+    Returns:
+        The kinetic potential energy
+    """
+    du = u(s) # current displacement
+    dv = v(s) # previous displacement
+
+    # computing kinetic potential energy
+    E = rho * (0.5 * wp.dot(du - dv, du - dv) / (dt * dt) - wp.dot(du, gravity))
+
+    # return the kinetic potential energy
+    return E
+
+
+@wp.kernel(enable_backward=True)
+def scale_lame(
+    lame_out: wp.array(dtype=wp.vec2),
+    lame_ref: wp.vec2,
+    scale: wp.array(dtype=float),
+):
+    """
+    Scale the lame parameters by a factor of scale. 
+
+    Args:
+        lame_out: output lame parameters
+        lame_ref: reference lame parameters
+        scale: scale factor
+
+    Returns:
+        The scaled lame parameters
+    """
+    i = wp.tid()
+    lame_out[i] = lame_ref * scale[i]
+
+
+class DisplacementPotential:
+    """Base class for additional potentials that depend only on the displacement field"""
+
+    def __init__(self, sim):
+        self.sim = weakref.proxy(sim)
+
+    def prepare_newton_step(self, dt, tape):
+        pass
+
+    def prepare_frame(self, dt):
+        pass
+
+    def init_constant_forms(self):
+        pass
+
+    def add_energy(self, E_u: wp.array):
+        pass
+
+    def add_hessian(self, lhs: sp.BsrMatrix):
+        pass
+
+    def add_forces(self, rhs: wp.array, _tape):
+        pass
+
+
 class Deformable: 
     def __init__(self, geo: fem.Geometry, active_cells: Optional[wp.array]):
         # TODO: implement argument parsing
