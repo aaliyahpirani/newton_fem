@@ -7,11 +7,45 @@ from pickle import NONE
 from typing import List, Optional, TextIO
 
 import numpy as np
-from .solver_fem import DT, N_BACKTRACK, QUASI_QUASISTATIC, QUIET, UP_AXIS, GRAVITY, YOUNG_MODULUS, POISSON_RATIO, DENSITY, SERENDIPITY, DEGREE, LUMPED_MASS, NEO_HOOKEAN, DG_JUMP_PEN, N_NEWTON, NEWTON_TOL, MATRIX_FREE
-
+from .solver_fem import (
+    DT, 
+    N_BACKTRACK, 
+    QUASI_QUASISTATIC, 
+    QUIET, 
+    UP_AXIS, 
+    GRAVITY, 
+    YOUNG_MODULUS, 
+    POISSON_RATIO, 
+    DENSITY, 
+    SERENDIPITY, 
+    DEGREE, 
+    LUMPED_MASS, 
+    NEO_HOOKEAN, 
+    DG_JUMP_PEN, 
+    N_NEWTON, 
+    NEWTON_TOL, 
+    MATRIX_FREE
+)
 import warp as wp
 import warp.fem as fem
 import warp.sparse as sp
+
+from .elasticity import (
+    hooke_energy,
+    hooke_hessian,
+    hooke_stress,
+    snh_energy,
+    snh_hessian_proj_analytic,
+    snh_stress,
+    symmetric_strain,
+    symmetric_strain_delta,
+)
+
+from .linalg import diff_bsr_mv
+from .linesearch_criterion import (
+    LineSearchNaiveCriterion,
+    LineSearchUnconstrainedArmijoCriterion,
+)
 
 class Deformable: 
     def __init__(self, geo: fem.Geometry, active_cells: Optional[wp.array]):
