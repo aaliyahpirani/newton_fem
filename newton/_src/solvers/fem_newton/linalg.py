@@ -17,10 +17,33 @@ from typing import Any, Tuple
 
 import warp as wp
 import warp.sparse as sp
-from warp.fem.utils import array_axpy
+from warp.fem.linalg import array_axpy
+from warp.optim.linear import LinearOperator, cg, preconditioner
 
 wp.set_module_options({"enable_backward": False})
 wp.set_module_options({"fast_math": True})
+
+
+def bsr_cg(
+    A: sp.BsrMatrix | LinearOperator,
+    b: wp.array,
+    x: wp.array,
+    *,
+    max_iters: int = 0,
+    tol: float | None = None,
+    quiet: bool = True,
+    use_diag_precond: bool = True,
+):
+    """Solve ``A x = b`` with conjugate gradient.
+
+    Thin wrapper around :func:`warp.optim.linear.cg` matching the calling
+    convention used by ClassicFEM.
+    """
+    del quiet  # residual printing not wired through yet
+    M = None
+    if use_diag_precond and not isinstance(A, LinearOperator):
+        M = preconditioner(A, "diag")
+    return cg(A=A, b=b, x=x, tol=tol, maxiter=max_iters, M=M)
 
 
 def diff_bsr_mv(

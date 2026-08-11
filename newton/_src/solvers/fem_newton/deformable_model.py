@@ -3,32 +3,17 @@ A newton-based FEM simulator.
 # TODO: Update explanation of the model
 """
 
-from pickle import NONE
-from typing import List, Optional, TextIO
+from __future__ import annotations
+
+import weakref
+from typing import TextIO
 
 import numpy as np
-from .solver_fem import (
-    DT, 
-    N_BACKTRACK, 
-    QUASI_QUASISTATIC, 
-    QUIET, 
-    UP_AXIS, 
-    GRAVITY, 
-    YOUNG_MODULUS, 
-    POISSON_RATIO, 
-    DENSITY, 
-    SERENDIPITY, 
-    DEGREE, 
-    LUMPED_MASS, 
-    NEO_HOOKEAN, 
-    DG_JUMP_PEN, 
-    N_NEWTON, 
-    NEWTON_TOL, 
-    MATRIX_FREE
-)
 import warp as wp
 import warp.fem as fem
 import warp.sparse as sp
+from warp.fem import Domain, Field, Sample
+from warp.optim.linear import LinearOperator
 
 from .elasticity import (
     hooke_energy,
@@ -40,8 +25,7 @@ from .elasticity import (
     symmetric_strain,
     symmetric_strain_delta,
 )
-
-from .linalg import diff_bsr_mv
+from .linalg import array_axpy, bsr_cg, diff_bsr_mv
 from .linesearch_criterion import (
     LineSearchNaiveCriterion,
     LineSearchUnconstrainedArmijoCriterion,
@@ -204,67 +188,127 @@ class DisplacementPotential:
         pass
 
 
-class Deformable: 
-    def __init__(self, geo: fem.Geometry, active_cells: Optional[wp.array]):
-        # TODO: implement argument parsing
-        
+class Deformable:
+    def __init__(
+        self,
+        geo: fem.Geometry,
+        active_cells: wp.array | None = None,
+        *,
+        degree: int = 1,
+        serendipity: bool = False,
+        discontinuous: bool = False,
+        n_newton: int = 2,
+        newton_tol: float = 1.0e-4,
+        cg_tol: float = 1.0e-6,
+        cg_iters: int = 250,
+        n_backtrack: int = 4,
+        young_modulus: float = 500.0,
+        poisson_ratio: float = 0.45,
+        gravity: float = 1.0,
+        up_axis: int = 1,
+        density: float = 1.0,
+        dt: float = 0.05,
+        quasi_quasistatic: bool = False,
+        neo_hookean: bool = False,
+        dg_jump_pen: float = 1.0,
+        quiet: bool = False,
+        lumped_mass: bool = False,
+        fp64: bool = False,
+        matrix_free: bool = False,
+        collision_stiffness: float = 1.0,
+        collision_radius: float = 0.5 / 64.0,
+        collision_detection_ratio: float = 2.0,
+        friction: float = 0.2,
+        friction_reg: float = 0.1,
+        friction_fluid: float = 0.01,
+        ground: bool = True,
+        ground_height: float = -1.0,
+        self_immunity_radius_ratio: float = 4.0,
+    ):
         self.geo = geo
 
-        if not active_cells:
-            # full mesh is used
-            self._geo_partition = fem.geometry.WholeGeometryPartition(geo)
-            self.cells = None
-        else:
-            # only active cells are used 
-            self._geo_partition = fem.ExplicitGeometryPartition(geo, cell_mask=active_cells)
-            self.cells = self._geo_partition._cells
+        self.degree = degree
+        self.serendipity = serendipity
+        self.discontinuous = discontinuous
+        self.n_newton = n_newton
+        self.newton_tol = newton_tol
+        self.cg_tol = cg_tol
+        self.cg_iters = cg_iters
+        self.n_backtrack = n_backtrack
+        self.young_modulus = young_modulus
+        self.poisson_ratio = poisson_ratio
+        self.gravity_magnitude = gravity
+        self.up_axis_index = up_axis
+        self.density = density
+        self.dt = dt
+        self.quasi_quasistatic = quasi_quasistatic
+        self.neo_hookean = neo_hookean
+        self.dg_jump_pen = dg_jump_pen
+        self.quiet = quiet
+        self.lumped_mass = lumped_mass
+        self.fp64 = fp64
+        self.matrix_free = matrix_free
+        self.collision_stiffness = collision_stiffness
+        self.collision_radius = collision_radius
+        self.collision_detection_ratio = collision_detection_ratio
+        self.friction = friction
+        self.friction_reg = friction_reg
+        self.friction_fluid = friction_fluid
+        self.ground = ground
+        self.ground_height = ground_height
+        self.self_immunity_radius_ratio = self_immunity_radius_ratio
 
-        self.dt = DT
+        if self.has_discontinuities() and not self.supports_discontinuities():
+            raise TypeError(f"Simulator of type {type(self)} does not support discontinuities")
+
+        if self.matrix_free and not self.supports_matrix_free():
+            raise TypeError(f"Simulator of type {type(self)} does not support matrix-free solves")
+
+        # Full geometry by default; optionally restrict to an active-cell mask.
+        self.geo_partition = fem.Cells(geo).geometry_partition
+        self.cells: wp.array | None = None
+
+        if active_cells is not None:
+            geo_partition = fem.ExplicitGeometryPartition(geo, cell_mask=active_cells)
+            if geo_partition.cell_count() < geo.cell_count():
+                self.geo_partition = geo_partition
+                self.cells = self.geo_partition._cells
+
+        if not self.quiet:
+            print(f"Active cells: {self.geo_partition.cell_count()}")
+
         self.up_axis = np.zeros(3)
-        self.up_axis[UP_AXIS] = 1.0
-
-        self.gravity = -GRAVITY * self.up_axis
-
-        self.forces = VolumetricForces()
-        # TODO: implement volumetric forces class 
-        self.forces.count = 0
-        # initialize no force vectors, added with add_force
-        self.forces.forces = wp.zeros(shape=(0,), dtype=wp.vec3)
-        # radius of influence of each force vector 
-        self.forces.radii = wp.zeros(shape=(0,), dtype=float)
-        # center of each force vector
-        self.forces.centers = wp.zeros(shape=(0,), dtype=wp.vec3)
-        # total weight of the force vector (used to get the net load)
-        self.forces.tot_weight = wp.zeros(shape=(0,), dtype=float)
-
-        young = YOUNG_MODULUS
-        poisson = POISSON_RATIO
+        self.up_axis[self.up_axis_index] = 1.0
+        self.gravity = -self.gravity_magnitude * self.up_axis
 
         # reference Lame parameters for linear elasticity, stored as 2 vector (lambda, mu)
-        self.lame_ref = wp.vec2(young / (1.0 + poisson) * np.array([poisson / (1.0 - 2.0 * poisson), 0.5]))
+        self.lame_ref = wp.vec2(
+            young_modulus
+            / (1.0 + poisson_ratio)
+            * np.array([poisson_ratio / (1.0 - 2.0 * poisson_ratio), 0.5])
+        )
 
         typical_length = 1.0
         self.typical_stiffness = max(
-            DENSITY * GRAVITY * typical_length,
+            density * gravity * typical_length,
             min(
-                YOUNG_MODULUS,  # handle no-gravity, quasistatic case
-                DENSITY * typical_length**2 / (DT**2),  # handle no-gravity, dynamic case
+                young_modulus,  # handle no-gravity, quasistatic case
+                density * typical_length**2 / (dt**2),  # handle no-gravity, dynamic case
             ),
         )
 
-
-        # set up line search critertion (accept vs reject)
+        # set up line search criterion (accept vs reject)
         self._ls = LineSearchNaiveCriterion(self)
-        # builds interpolation basis for displacement field (defines how nodal 
-        # DOFS map to values inside each element))
+        # builds interpolation basis for displacement field (defines how nodal
+        # DOFS map to values inside each element)
         self._init_displacement_basis()
 
-        self.energy_potentials = []
+        self.energy_potentials: list[DisplacementPotential] = []
 
-        self._collision_projector_form: Optional[fem.operator.Integrand] = None
+        self._collision_projector_form: fem.operator.Integrand | None = None
         self._collision_projector_args = {}
 
-        self.log = None
+        self.log: TextIO | None = None
 
     def has_discontinuities(self) -> bool:
         return isinstance(self.geo, fem.AdaptiveNanogrid)
@@ -275,36 +319,37 @@ class Deformable:
     def supports_matrix_free(self) -> bool:
         return False
 
-    def add_energy_potential(self, potential: EnergyPotential):
+    def add_energy_potential(self, potential: DisplacementPotential):
         self.energy_potentials.append(potential)
 
     def _init_displacement_basis(self):
         """
         Initializes the displacement basis. Lagrange has more DOFs and a richer approximation
-        while Serendipity is a reduced version of lagrange, that drops many interior nodes. 
+        while Serendipity is a reduced version of lagrange, that drops many interior nodes.
         """
-        element_basis = fem.ElementBasis.SERENDIPITY if SERENDIPITY else fem.ElementBasis.LAGRANGE
+        element_basis = fem.ElementBasis.SERENDIPITY if self.serendipity else fem.ElementBasis.LAGRANGE
         self._displacement_basis = fem.make_polynomial_basis_space(
             self.geo,
-            degree=DEGREE,
+            degree=self.degree,
             element_basis=element_basis,
+            discontinuous=self.discontinuous,
         )
 
-    def set_displacement_basis(self, basis: fem.BasisSpace):
+    def set_displacement_basis(self, basis: fem.BasisSpace | None = None):
         if basis is None:
             self._init_displacement_basis()
-        else: 
+        else:
             self._displacement_basis = basis
 
-    def init_displacement_space(self, side_subdomain: Optional[fem.Domain] = None):
+    def init_displacement_space(self, side_subdomain: fem.Domain | None = None):
         """
-        Allocates the displacement space and related fields. 
+        Allocates the displacement space and related fields.
         """
         # create 3d vectors for the active cells (defines layout)
         u_space = fem.make_collocated_function_space(self._displacement_basis, dtype=wp.vec3)
         u_space_partition = fem.make_space_partition(
             space_topology=self._displacement_basis.topology,
-            geometry_partition=self._geo_partition,
+            geometry_partition=self.geo_partition,
             with_halo=False,
         )
 
@@ -320,7 +365,9 @@ class Deformable:
         self.u_trial = fem.make_trial(space=u_space, space_partition=u_space_partition)
         self.u_test = fem.make_test(space=u_space, space_partition=u_space_partition)
 
-        self.displacement_quadrature = fem.RegularQuadrature(self.u_test.domain, order=2 * DEGREE)
+        self.displacement_quadrature = fem.RegularQuadrature(self.u_test.domain, order=2 * self.degree)
+        # Alias used by collision code / Mixed FEM ports
+        self.vel_quadrature = self.displacement_quadrature
 
         # DG style integration on sides for discontinuous elements
         if self.has_discontinuities():
@@ -332,10 +379,10 @@ class Deformable:
             self.u_side_trial = fem.make_trial(space=u_space, space_partition=u_space_partition, domain=sides)
             self.u_side_test = fem.make_test(space=u_space, space_partition=u_space_partition, domain=sides)
 
-            self.side_quadrature = fem.RegularQuadrature(self.u_side_test.domain, order=2 * args.degree)
+            self.side_quadrature = fem.RegularQuadrature(self.u_side_test.domain, order=2 * self.degree)
         else:
             self.side_quadrature = None
-        
+
         # Create material parameters space with same basis as deformation field
         lame_space = fem.make_polynomial_space(self.geo, dtype=wp.vec2)
 
@@ -354,7 +401,7 @@ class Deformable:
         u_space = self.u_field.space
 
         # Displacement boundary conditions (restrit to boundary faces)
-        boundary = fem.BoundarySides(self._geo_partition)
+        boundary = fem.BoundarySides(self.geo_partition)
 
         # test/trial functions on the boundary domain, so we can assemble which boundary nodes are constrained
         u_bd_test = fem.make_test(
@@ -427,39 +474,36 @@ class Deformable:
         Initializes the constant forms for the linear system (these are forms
         that do not change after object initialization)
         """
-        # builds the inertia matrix A 
-        if LUMPED_MASS:
+        # builds the inertia matrix A
+        if self.lumped_mass:
             # diagonal mass matrix (approximate)
             self.A = fem.integrate(
                 inertia_form,
                 fields={"u": self.u_trial, "v": self.u_test},
-                values={"rho": DENSITY, "dt": self.dt},
+                values={"rho": self.density, "dt": self.dt},
                 output_dtype=float,
-                assembly="nodal"
+                assembly="nodal",
             )
         else:
             self.A = fem.integrate(
                 inertia_form,
                 fields={"u": self.u_trial, "v": self.u_test},
-                values={"rho": DENSITY, "dt": self.dt},
+                values={"rho": self.density, "dt": self.dt},
                 output_dtype=float,
                 quadrature=self.displacement_quadrature,
             )
-         # if discontinuous penalty is used, add to inertia matrix 
-        if self.side_quadrature is not None and DG_JUMP_PEN > 0.0:
+        # if discontinuous penalty is used, add to inertia matrix
+        if self.side_quadrature is not None and self.dg_jump_pen > 0.0:
             self.A += fem.integrate(
                 dg_penalty_form,
                 fields={"u": self.u_side_trial, "v": self.u_side_test},
-                values={"k": self.typical_stiffness * DG_JUMP_PEN},
+                values={"k": self.typical_stiffness * self.dg_jump_pen},
                 quadrature=self.side_quadrature,
                 output_dtype=float,
             )
-        # finalize the matrix's nonzero pattern 
+        # finalize the matrix's nonzero pattern
         self.A.nnz_sync()
-        # for each force vector, update the tot_weight
-        self.update_force_weight()
 
-        # TODO: implement energy potentials
         for potential in self.energy_potentials:
             potential.init_constant_forms()
 
@@ -499,18 +543,18 @@ class Deformable:
             fem.integrate(
                 displacement_rhs_form,
                 fields={"u": self.du_field, "u_prev": self.du_prev, "v": self.u_test},
-                values={"rho": args.density, "dt": self._step_dt(), "gravity": gravity},
+                values={"rho": self.density, "dt": self._step_dt(), "gravity": gravity},
                 output=rhs,
                 quadrature=self.displacement_quadrature,
                 kernel_options={"enable_backward": True},
             )
-            # for discontinuous elements, add penalty terms for forces to resist unwanted displacement jumps 
-            if self.side_quadrature is not None and self.args.dg_jump_pen > 0.0:
+            # for discontinuous elements, add penalty terms for forces to resist unwanted displacement jumps
+            if self.side_quadrature is not None and self.dg_jump_pen > 0.0:
                 # add discontinuous penalty terms
                 fem.integrate(
                     dg_penalty_form,
                     fields={"u": self.u_field.trace(), "v": self.u_side_test},
-                    values={"k": -self.typical_stiffness * self.args.dg_jump_pen},
+                    values={"k": -self.typical_stiffness * self.dg_jump_pen},
                     quadrature=self.side_quadrature,
                     output=rhs,
                     add=True,
@@ -544,12 +588,12 @@ class Deformable:
         (self.du_field, self.du_prev) = (self.du_prev, self.du_field)
 
         # in quasi-quasistatic mode, reset du_prev to zero - this removes the effect of the previous frame
-        if QUASI_QUASISTATIC:
+        if self.quasi_quasistatic:
             self.du_prev.dof_values.zero_()
 
-        self.prepare_frame() # computes initial guess for next frame (including potentials)
+        self.prepare_frame()  # computes initial guess for next frame (including potentials)
 
-        tol = NEWTON_TOL**2 # sets tolerance for newton's method
+        tol = self.newton_tol**2  # sets tolerance for newton's method
 
         def host_read(tup):
             """
@@ -557,11 +601,11 @@ class Deformable:
             """
             return (x[:1].numpy()[0] if isinstance(x, wp.array) else x for x in tup)
 
-        E_cur, C_cur = host_read(self.evaluate_energy()) # evaluates current total energy and constraint residual 
+        E_cur, C_cur = host_read(self.evaluate_energy())  # evaluates current total energy and constraint residual
         cumulative_time = 0.0
 
         # prints initial guess for energy and constraint residual if not quiet
-        if not QUIET:
+        if not self.quiet:
             print(f"Newton initial guess: E={E_cur}, Cr={C_cur}")
         if self.log:
             mean_displ = np.mean(np.linalg.norm(self.du_field.dof_values.numpy(), axis=1))
@@ -571,37 +615,36 @@ class Deformable:
             )
 
         # runs for n_newton iterations
-        for k in range(N_NEWTON):
-            
+        for k in range(self.n_newton):
             with wp.ScopedTimer(f"Iter {k}", print=False) as timer:
-                E_ref, C_ref = E_cur, C_cur # stores our current guesses as references
-                self.checkpoint_newton_values() # saves a snapshot of current state
+                E_ref, C_ref = E_cur, C_cur  # stores our current guesses as references
+                self.checkpoint_newton_values()  # saves a snapshot of current state
 
                 self.prepare_newton_step()
                 rhs = self.newton_rhs()
                 lhs = self.newton_lhs()
                 delta_fields = self.solve_newton_system(lhs, rhs)
 
-                self.apply_newton_deltas(delta_fields) # applies the displacement deltas 
+                self.apply_newton_deltas(delta_fields)  # applies the displacement deltas
                 E_cur, C_cur = host_read(self.evaluate_energy())
 
-                ddu = delta_fields[0] # displacement delta storage
-                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0]) # calculates the average magnitude of the correction   
+                ddu = delta_fields[0]  # displacement delta storage
+                step_size = wp.utils.array_inner(ddu, ddu) / (1 + ddu.shape[0])  # average correction magnitude
 
                 # linear model
-                self._ls.build_linear_model(lhs, rhs, delta_fields) # builds model of energy change 
+                self._ls.build_linear_model(lhs, rhs, delta_fields)  # builds model of energy change
 
                 # Line search
                 alpha = 1.0
-                for _j in range(N_BACKTRACK):
-                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref): # if we accept the step
+                for _j in range(self.n_backtrack):
+                    if self._ls.accept(alpha, E_cur, C_cur, E_ref, C_ref):  # if we accept the step
                         break
 
-                    alpha = 0.5 * alpha # try again with a smaller step 
+                    alpha = 0.5 * alpha  # try again with a smaller step
                     self.apply_newton_deltas(delta_fields, alpha=alpha)
                     E_cur, C_cur = host_read(self.evaluate_energy())
 
-                if not QUIET:
+                if not self.quiet:
                     print(f"Newton iter {k}: E={E_cur}, Cr={C_cur}, step size {np.sqrt(step_size)}, alpha={alpha}")
 
             cumulative_time += timer.elapsed
@@ -650,26 +693,25 @@ class Deformable:
             return
 
         delta_du = delta_fields[0]
-        wp.array_axpy(x=delta_du, y=self.u_field.dof_values, alpha=alpha)
-        wp.array_axpy(x=delta_du, y=self.du_field.dof_values, alpha=alpha)
+        array_axpy(x=delta_du, y=self.u_field.dof_values, alpha=alpha)
+        array_axpy(x=delta_du, y=self.du_field.dof_values, alpha=alpha)
 
     def _step_dt(self):
         # In fake quasistatic mode, use a large timestep for the rhs computation
         # Note that self.dt is still use to compute lhs (inertia matrix)
-        return 1.0e6 if QUASI_QUASISTATIC else self.dt
+        return 1.0e6 if self.quasi_quasistatic else self.dt
 
     def evaluate_energy(self, E_u=None, cr=None):
-        """ Evaluates the energy of the system.
-        """
+        """Evaluates the energy of the system."""
         if E_u is None:
-            E_u = wp.zeros(shape=(1,), dtype=float) # create a storage array
+            E_u = wp.zeros(shape=(1,), dtype=float)  # create a storage array
 
-        E_u = fem.integrate( # integrate the kinetic and potential energy terms over the domain
+        E_u = fem.integrate(  # integrate the kinetic and potential energy terms over the domain
             kinetic_potential_energy,
             quadrature=self.displacement_quadrature,
             fields={"u": self.du_field, "v": self.du_prev},
             values={
-                "rho": DENSITY,
+                "rho": self.density,
                 "dt": self._step_dt(),
                 "gravity": self.gravity,
             },
@@ -677,11 +719,11 @@ class Deformable:
             add=True,
         )
         # if we have discontinuities, add penalty forces
-        if self.side_quadrature is not None and DG_JUMP_PEN > 0.0: # if there are discontinuities, add penalty terms for forces to resist unwanted displacement jumps 
+        if self.side_quadrature is not None and self.dg_jump_pen > 0.0:
             fem.integrate(
                 dg_penalty_form,
                 fields={"u": self.u_field.trace(), "v": self.u_field.trace()},
-                values={"k": 0.5 * self.typical_stiffness * DG_JUMP_PEN},
+                values={"k": 0.5 * self.typical_stiffness * self.dg_jump_pen},
                 quadrature=self.side_quadrature,
                 output=E_u,
                 add=True,
@@ -759,15 +801,15 @@ class ClassicFEM(Deformable):
     elastic Newton physics. It contains models for Neo-Hookean and Corotational elasticity, 
     including energy, forces, Hessian and stress. 
     """
-    def __init__(self, geo: fem.Geometry, active_cells: Optional[wp.array]):
-        super().__init__(geo, active_cells)
+    def __init__(self, geo: fem.Geometry, active_cells: wp.array | None = None, **kwargs):
+        super().__init__(geo, active_cells, **kwargs)
 
         self._ls = LineSearchUnconstrainedArmijoCriterion(self)
 
         self._make_elasticity_forms()
 
     def _make_elasticity_forms(self):
-        if NEO_HOOKEAN:
+        if self.neo_hookean:
             # neo-hookean elasticity
             self.elastic_energy = ClassicFEM.nh_elastic_energy
             self.elastic_forces = ClassicFEM.nh_elastic_forces
@@ -792,14 +834,14 @@ class ClassicFEM(Deformable):
         self._svd_sides_V = None
 
     def _elasticity_form_arguments(self):
-        if NEO_HOOKEAN:
+        if self.neo_hookean:
             return {}
 
         # cached polar decomposition
         return {"Us": self._svd_U, "Vs": self._svd_V, "sigs": self._svd_sig}
 
     def _sides_elasticity_form_arguments(self):
-        if NEO_HOOKEAN:
+        if self.neo_hookean:
             return {}
 
         # cached polar decomposition
@@ -810,23 +852,24 @@ class ClassicFEM(Deformable):
         }
 
     def supports_discontinuities(self) -> bool:
-        return not NEO_HOOKEAN
+        return not self.neo_hookean
 
     def supports_matrix_free(self) -> bool:
         return not self.has_discontinuities()
 
-    def _init_strain_spaces(self):
+    def init_strain_spaces(self):
         """
-        Initializes space for strain calculations. 
+        Initializes space for strain calculations.
         """
         self.elasticity_quadrature = self.displacement_quadrature
+        self.strain_quadrature = self.displacement_quadrature
         self.constraint_field = self.interpolated_constraint_field
         self._constraint_field_restriction = fem.make_restriction(
             self.constraint_field, space_restriction=self.u_test.space_restriction
         )
 
     def set_strain_basis(self, strain_basis: fem.BasisSpace):
-        pass
+        del strain_basis
 
     def prepare_newton_step(self, tape: wp.Tape = None):
         """
@@ -836,7 +879,7 @@ class ClassicFEM(Deformable):
         super().prepare_newton_step(tape=tape)
 
         # cache polar decomp for non-neohookean materials
-        if not NEO_HOOKEAN:
+        if not self.neo_hookean:
             if tape is not None:
                 with tape:
                     self._cache_polar_decomposition()
@@ -877,8 +920,8 @@ class ClassicFEM(Deformable):
         """
         Constructs the matrix on the LHS of the newton system. 
         """
-        if MATRIX_FREE:
-            return NONE
+        if self.matrix_free:
+            return None
 
         # integrate elasticity hessian to get matrix
         # output is a sparse BSR stiffness matrix
@@ -1028,9 +1071,9 @@ class ClassicFEM(Deformable):
         """
         solves the linear system assembled by newton_lhs and newton_Rhs
         """
-        if self.args.fp64:
+        if self.fp64:
             res = wp.empty_like(rhs)
-            ClassicFEM._solve_fp64(lhs, rhs, res, maxiters=self.args.cg_iters, tol=self.args.cg_tol)
+            ClassicFEM._solve_fp64(lhs, rhs, res, maxiters=self.cg_iters, tol=self.cg_tol)
             return (res,)
 
         if lhs is None:
@@ -1045,8 +1088,8 @@ class ClassicFEM(Deformable):
             b=rhs,
             x=res,
             quiet=True,
-            tol=self.args.cg_tol,
-            max_iters=self.args.cg_iters,
+            tol=self.cg_tol,
+            max_iters=self.cg_iters,
             use_diag_precond=use_diag_precond,
         )
         return (res,)
@@ -1066,7 +1109,7 @@ class ClassicFEM(Deformable):
         # solve the system
         def solve_backward():
             adj_res = self.u_field.dof_values.grad
-            ClassicFEM._solve_fp64(lhs, adj_res, rhs.grad, maxiters=self.args.cg_iters)
+            ClassicFEM._solve_fp64(lhs, adj_res, rhs.grad, maxiters=self.cg_iters)
 
         # record the stress interpolation 
         tape.record_func(
@@ -1204,7 +1247,7 @@ class ClassicFEM(Deformable):
 
         temporary_store = fem.TemporaryStore()
 
-        if self.args.neo_hookean:
+        if self.neo_hookean:
 
             def matvec(x: wp.array, y: wp.array, z: wp.array, alpha: float, beta: float):
                 """Compute z = alpha * A @ x + beta * y"""
@@ -1218,7 +1261,7 @@ class ClassicFEM(Deformable):
                         "v": self.u_test,
                         "lame": self.lame_field,
                     },
-                    values={"rho": self.args.density, "dt": self.dt},
+                    values={"rho": self.density, "dt": self.dt},
                     output=z,
                     temporary_store=temporary_store,
                 )
@@ -1241,7 +1284,7 @@ class ClassicFEM(Deformable):
                         "lame": self.lame_field,
                     },
                     values={
-                        "rho": self.args.density,
+                        "rho": self.density,
                         "dt": self.dt,
                         **self._elasticity_form_arguments(),
                     },

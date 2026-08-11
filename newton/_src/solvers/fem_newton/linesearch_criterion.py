@@ -40,7 +40,7 @@ class LineSearchNaiveCriterion(LineSearch):
     """
     def __init__(self, sim):
         super().__init__(sim)
-        self.penalty = sim.args.young_modulus # default penalty for the constraint 
+        self.penalty = sim.young_modulus  # default penalty for the constraint 
 
     def build_linear_model(self, sim, lhs, rhs, delta_fields):
         pass

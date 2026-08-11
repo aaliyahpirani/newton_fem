@@ -19,7 +19,7 @@ import warp as wp
 import warp.fem as fem
 from warp.fem import Domain, Field, Sample
 
-from .deformable_model import DisplacementPotential, SoftbodySim
+from .deformable_model import DisplacementPotential
 
 
 @wp.struct
