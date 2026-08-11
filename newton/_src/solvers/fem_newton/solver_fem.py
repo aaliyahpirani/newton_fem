@@ -16,6 +16,9 @@ from .sdf_kernel import mesh_sdf_kernel
 
 @fem.integrand
 def deformed_position(s: fem.Sample, domain: fem.Domain, displacement: fem.Field):
+    """
+    Compute the deformed position of a sample on the surface of a mesh. 
+    """
     return domain(s) + displacement(s)
 
 
@@ -30,7 +33,9 @@ def fixed_points_projector_form(
     axis_min: float,
     axis_max: float,
 ):
-    """Dirichlet projector that clamps nodes near the domain bounds along ``up_axis``."""
+    """Integrand that marks which FEM nodes are Dirichlet-fixed or the hanging-style clamp. The node is constrained if it is outside of axis_max or axis_min.
+    It returns a 1.0 if the node is constrained, and a 0 otherwise. It assembles into a diagonal ish projector. 
+    """
     coord = domain(s)[up_axis]
     clamped = wp.where(coord > axis_max or coord < axis_min, 1.0, 0.0)
     return wp.dot(u(s), v(s)) * clamped
@@ -40,7 +45,7 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
     """Implicit Newton FEM solver for volumetric soft bodies.
 
     .. experimental::
-        Public API and behavior may change without prior notice.
+
     """
 
     def __init__(
@@ -120,10 +125,13 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             ground_height: Ground plane height along ``up_axis``.
             self_immunity_radius_ratio: Rest-space self-contact immunity radius ratio.
         """
+        # initialize base solver 
         super().__init__(model)
 
+        # soft bodies are made of particles 
         if model.particle_count == 0:
             raise ValueError("SolverFEMNewton requires a model with particles.")
+        # triangle connectivity 
         if model.tri_indices is None or model.tri_indices.size == 0:
             raise ValueError("SolverFEMNewton requires model.tri_indices (surface triangles).")
 
@@ -167,10 +175,11 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             "ground_height": ground_height,
             "self_immunity_radius_ratio": self_immunity_radius_ratio,
         }
-
+        # every soft body particle position
         self.points = model.particle_q
-        # wp.Mesh expects a flat index buffer.
+        # wp.Mesh expects a flat index buffer
         self.indices = model.tri_indices.flatten()
+        # creates a mesh object from the poitns and indices 
         self.mesh = wp.Mesh(self.points, self.indices, support_winding_number=True)
 
         self.sim: ClassicFEM | None = None
@@ -186,15 +195,17 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
         )
         self.grid_node_positions = fem.make_polynomial_space(self.geo).node_positions()
         self.grid_sdf = wp.empty(self.grid_node_positions.shape[0], dtype=float)
-
         wp.launch(
             mesh_sdf_kernel,
             dim=self.grid_node_positions.shape,
             inputs=[self.mesh.id, self.grid_node_positions, self.grid_sdf],
         )
-        self.cell_vtx = grid_cell_vertex_indices(self.resolution)
-        self.active_cells = wp.empty(self.cell_vtx.shape[0], dtype=int)
 
+        # lookup table for every hex cell on the background grid (ie which grid nodes are its corners)
+        self.cell_vtx = grid_cell_vertex_indices(self.resolution)
+        
+        # mark active cells that intersect the interior of the SDF
+        self.active_cells = wp.empty(self.cell_vtx.shape[0], dtype=int)
         find_active_cells(
             self.grid_sdf,
             self.active_cells,
@@ -202,13 +213,26 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             cell_vtx=self.cell_vtx,
         )
 
+        # initialize the deformable simulation and displacement spaces 
         self.init_deformable_simulation(model, active_cells=self.active_cells)
 
     def init_deformable_simulation(self, model: Model, active_cells: wp.array | None = None):
-        """Create the ClassicFEM simulation and initialize displacement spaces."""
+        """
+        Create the ClassicFEM simulation and initialize displacement spaces.
+        
+        Args:
+            model: Newton model providing particle state layout.
+            active_cells: wp.array of shape [resolution**3] marking active cells.
+        
+        Returns: 
+            None. Initializes fields for deformable simulation. 
+        """
+
         sim = ClassicFEM(self.geo, active_cells, **self.sim_kwargs)
         sim.init_displacement_space()
         sim.init_strain_spaces()
+
+        # marks the nodes out side of the region as fixed points 
         sim.set_fixed_points_condition(
             fixed_points_projector_form,
             {
@@ -217,7 +241,10 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
                 "axis_max": self.y_max,
             },
         )
+
+
         sim.init_constant_forms()
+        # not necessary for ClassicFEM
         sim.project_constant_forms()
 
         self.sim = sim

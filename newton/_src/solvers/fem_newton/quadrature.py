@@ -35,17 +35,15 @@ def _resolution_from_node_count(node_count: int) -> int:
 
 
 def grid_cell_vertex_indices(resolution: int, device=None) -> wp.array:
-    """Build hex corner indices matching :class:`warp.fem.Grid3D` node ordering.
-
-    Node index layout is ``x`` slowest, then ``y``, then ``z`` fastest
-    (``index = x * (res + 1)**2 + y * (res + 1) + z``).
+    """Builds a lookup table for every hex cell on the background grid, which 8 grid nodes are its corners. It helps
+    connect each of the grid nodes to the corresponding hex cell. 
 
     Args:
         resolution: Number of cells along each axis.
         device: Warp device for the returned array.
 
     Returns:
-        ``wp.array`` of shape ``[resolution**3, 8]`` with corner node indices.
+        A wp.array of shape [resolution**3, 8] with corner node indices.
     """
     res = int(resolution)
     n = res + 1

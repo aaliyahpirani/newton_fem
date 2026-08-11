@@ -66,7 +66,7 @@ class Example:
             up_axis=2,
             gravity=args.gravity,
             young_modulus=args.young_modulus,
-            poisson_ratio=0.45,
+            poisson_ratio=0.1,
             density=1.0,
             dt=self.sim_dt,
             n_newton=args.newton_iters,
