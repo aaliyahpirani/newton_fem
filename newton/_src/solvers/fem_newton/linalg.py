@@ -57,7 +57,7 @@ def diff_bsr_mv(
 ):
     """Performs y = alpha*A*x + beta*y and records the adjoint on the tape"""
 
-    from warp.context import runtime
+    from warp._src.context import runtime
 
     tape = runtime.tape
     if tape is not None and (x.requires_grad or y.requires_grad):

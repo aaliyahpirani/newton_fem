@@ -243,7 +243,7 @@ class CollisionHandler:
             world_position,
             fields={"u": self.sim.u_field},
             dest=dest,
-            quadrature=cp_pic,
+            at=cp_pic,
         )
         # return the destination array
         return dest
@@ -268,7 +268,7 @@ class CollisionHandler:
         fem.interpolate(
             du_field,
             dest=dest,
-            quadrature=cp_pic,
+            at=cp_pic,
         )
 
         return dest
@@ -455,7 +455,7 @@ class CollisionHandler:
         )
         fem.interpolate(
             u_trial,
-            quadrature=a_contact_pic,
+            at=a_contact_pic,
             dest=self._collision_jacobian_a,
             kernel_options={"enable_backward": False},
         )
@@ -467,7 +467,7 @@ class CollisionHandler:
         )
         fem.interpolate(
             u_trial,
-            quadrature=b_contact_pic,
+            at=b_contact_pic,
             dest=self._collision_jacobian_b,
             kernel_options={"enable_backward": False},
         )

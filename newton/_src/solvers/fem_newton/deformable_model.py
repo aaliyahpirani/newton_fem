@@ -389,6 +389,14 @@ class Deformable:
         self.lame_field = lame_space.make_field()
         self.lame_field.dof_values.fill_(self.lame_ref)
 
+        # Stress / strain interpolation back onto the displacement basis.
+        interpolated_constraint_space = fem.make_collocated_function_space(
+            self._displacement_basis, dtype=wp.mat33
+        )
+        self.interpolated_constraint_field = interpolated_constraint_space.make_field(
+            space_partition=u_space_partition
+        )
+
     def set_boundary_condition(
         self,
         boundary_projector_form,
@@ -436,17 +444,21 @@ class Deformable:
 
     def set_fixed_points_condition(
         self,
-        fixed_points_projector_form
+        fixed_points_projector_form,
+        fixed_point_projector_args: dict | None = None,
     ):
-        """
-        Builds the Dirichlet boundary condition for fixed points only. 
-        """
+        """Build a Dirichlet projector that fixes selected nodes.
 
+        Args:
+            fixed_points_projector_form: Integrand that marks constrained nodes.
+            fixed_point_projector_args: Optional integrand ``values`` (e.g. clamp
+                bounds ``y_min`` / ``y_max``).
+        """
         self.v_bd_rhs = None
-        # assemble matrix for fixed points only 
         self.v_bd_matrix = fem.integrate(
             fixed_points_projector_form,
             fields={"u": self.u_trial, "v": self.u_test, "u_cur": self.u_field},
+            values=fixed_point_projector_args or {},
             assembly="nodal",
             output_dtype=float,
         )
@@ -507,10 +519,7 @@ class Deformable:
         for potential in self.energy_potentials:
             potential.init_constant_forms()
 
-    def project_constant_forms(self): 
-        """
-        Projects the constant forms onto the constrained DOFs. 
-        """
+    def project_constant_forms(self):
         pass
 
     def constraint_free_rhs(self, dt=None, with_external_forces=True, tape=None):
@@ -759,17 +768,17 @@ class Deformable:
             fem.normalize_dirichlet_projector(self.v_bd_matrix)
             self.project_constant_forms()
 
-        # temp storage 
+        # temp storage
         orig_rhs = fem.borrow_temporary_like(u_rhs, temporary_store)
-        orig_rhs.array.assign(u_rhs)
+        orig_rhs.assign(u_rhs)
 
-        # tape for adjoint computation 
+        # tape for adjoint computation
         proj_tape = wp.Tape() if tape is None else tape
         # perform projection
         with proj_tape:
             diff_bsr_mv(
                 A=self.v_bd_matrix,
-                x=orig_rhs.array,
+                x=orig_rhs,
                 y=u_rhs,
                 alpha=-1.0,
                 beta=1.0,
@@ -955,7 +964,7 @@ class ClassicFEM(Deformable):
 
         # constraint_free_lhs is the matrix of the constraint free system
         u_matrix += self.constraint_free_lhs()
-        fem.dirichlet.project_system_matrix(u_matrix, self.v_bd_matrix) # projcet to enforce boundary conditions
+        fem.project_system_matrix(u_matrix, self.v_bd_matrix)  # enforce boundary conditions
 
         return u_matrix
 
@@ -1021,7 +1030,7 @@ class ClassicFEM(Deformable):
 
         fem.interpolate(
             ClassicFEM._polar_decomposition,
-            quadrature=self.elasticity_quadrature,
+            at=self.elasticity_quadrature,
             fields={"u": self.u_field},
             values={"Us": self._svd_U, "Vs": self._svd_V, "sigs": self._svd_sig},
         )
@@ -1035,7 +1044,7 @@ class ClassicFEM(Deformable):
 
             fem.interpolate(
                 ClassicFEM._polar_decomposition,
-                quadrature=self.side_quadrature,
+                at=self.side_quadrature,
                 fields={"u": self.u_field.trace()},
                 values={
                     "Us": self._svd_sides_U,
