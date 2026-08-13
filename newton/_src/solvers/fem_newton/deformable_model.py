@@ -600,6 +600,7 @@ class Deformable:
         if self.quasi_quasistatic:
             self.du_prev.dof_values.zero_()
 
+
         self.prepare_frame()  # computes initial guess for next frame (including potentials)
 
         tol = self.newton_tol**2  # sets tolerance for newton's method
@@ -609,6 +610,7 @@ class Deformable:
             Helper function to read values from wp.array to numpy array on CPU
             """
             return (x[:1].numpy()[0] if isinstance(x, wp.array) else x for x in tup)
+
 
         E_cur, C_cur = host_read(self.evaluate_energy())  # evaluates current total energy and constraint residual
         cumulative_time = 0.0

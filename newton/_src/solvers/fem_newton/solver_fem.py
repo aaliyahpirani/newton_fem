@@ -12,6 +12,7 @@ from ..solver import SolverBase
 from .deformable_model import ClassicFEM
 from .quadrature import find_active_cells, grid_cell_vertex_indices
 from .sdf_kernel import mesh_sdf_kernel
+from .self_collision import MeshSelfCollisionHandler, CollisionPotential
 
 
 @fem.integrand
@@ -193,7 +194,9 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             bounds_lo=wp.vec3(-1.0),
             bounds_hi=wp.vec3(1.0),
         )
+        # 3d coordinates of the grid nodes
         self.grid_node_positions = fem.make_polynomial_space(self.geo).node_positions()
+        # sdf of the grid nodes 
         self.grid_sdf = wp.empty(self.grid_node_positions.shape[0], dtype=float)
         wp.launch(
             mesh_sdf_kernel,
@@ -242,18 +245,23 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             },
         )
 
-
-        sim.init_constant_forms()
-        # not necessary for ClassicFEM
-        sim.project_constant_forms()
-
         self.sim = sim
         self.rest_points = wp.clone(model.particle_q)
+        # interpolates local coordinates of the surface vertices to the grid nodes 
         self.surface_vtx_quadrature = fem.PicQuadrature(
             self.sim.u_test.domain,
             self.rest_points,
             max_dist=4.0 / float(self.resolution),
         )
+
+        self.collision_handler = MeshSelfCollisionHandler(self.surface_vtx_quadrature, self.mesh)
+        collision_potential = CollisionPotential(self.sim, self.collision_handler)
+        self.sim.add_energy_potential(collision_potential)
+        # forms that do not change within a frame
+        sim.init_constant_forms()
+        # not necessary for ClassicFEM
+        sim.project_constant_forms()
+        
         self._sim_initialized = True
 
     def is_initialized(self) -> bool:
@@ -263,18 +271,22 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ) -> None:
         del control, contacts
+        # define the simulation object 
         sim = self.sim
         if sim is None:
             raise RuntimeError("Simulation has not been created; call init_deformable_simulation() first.")
 
+        # set the timestep
         sim.dt = dt
+        # run the frame
         sim.run_frame()
 
-        # Keep particle velocities from the input state; only positions are FEM-driven.
+        # store the previous particle velocities in state_in
         if state_out is not state_in:
             if state_out.particle_qd is not None and state_in.particle_qd is not None:
                 state_out.particle_qd.assign(state_in.particle_qd)
 
+        # interpolate the deformed positions to the surface vertices 
         fem.interpolate(
             deformed_position,
             at=self.surface_vtx_quadrature,
