@@ -27,6 +27,7 @@ except ModuleNotFoundError:
     # Warp 1.17+ relocated this helper under the private package path.
     from warp._src.fem.geometry.closest_point import project_on_tri_at_origin
 
+from ...sim import Contacts
 from .deformable_model import Deformable, DisplacementPotential
 
 class CollisionHandler:
@@ -43,6 +44,13 @@ class CollisionHandler:
 
         self.collision_quadrature = None
         self.n_contact = 0
+        self._pipeline_contacts: Contacts | None = None
+        self._pipeline_body_q: wp.array | None = None
+        self._pipeline_shape_body: wp.array | None = None
+        self._pipeline_particle_radius: wp.array | None = None
+        self._pipeline_shape_margin: wp.array | None = None
+        self._particle_quadrature = None
+        self._n_particles = 0
 
     def init_collision_detector(self, sim: Deformable):
         """
@@ -64,6 +72,11 @@ class CollisionHandler:
             measures=wp.ones(n_cp, dtype=float),
         )
         self.set_collision_quadrature(collision_quadrature)
+        # Frozen copy of the original surface-vertex PIC. Self-collision may replace
+        # ``collision_quadrature`` with extra B samples; Newton particle ids still
+        # index this original set.
+        self._particle_quadrature = collision_quadrature
+        self._n_particles = n_cp
         self.n_contact = 0
 
         max_contacts = 10 * self.cp_cell_indices.shape[0]
@@ -86,6 +99,35 @@ class CollisionHandler:
 
     def set_collision_quadrature(self, quadrature: fem.PicQuadrature):
         self.collision_quadrature = quadrature
+
+    def set_pipeline_contacts(
+        self,
+        contacts: Contacts | None,
+        *,
+        body_q: wp.array[wp.transform] | None,
+        shape_body: wp.array[int] | None,
+        particle_radius: wp.array[float] | None,
+        shape_margin: wp.array[float] | None,
+    ) -> None:
+        """Store :class:`~newton.Contacts` from :class:`~newton.CollisionPipeline` for this step.
+
+        The pipeline reports geometry only (particle, shape, body-frame point,
+        world normal, body velocity). Penalty magnitude stays the FEM
+        ``collision_stiffness`` / ``collision_radius`` law.
+
+        Args:
+            contacts: Soft-rigid contact buffer, or ``None`` to skip pipeline contacts.
+            body_q: Body transforms [m, unitless], shape [body_count]. Unused for
+                static shapes (``shape_body == -1``).
+            shape_body: Parent body index per shape, shape [shape_count].
+            particle_radius: Particle contact radii [m], shape [particle_count].
+            shape_margin: Per-shape contact margins [m], shape [shape_count].
+        """
+        self._pipeline_contacts = contacts
+        self._pipeline_body_q = body_q
+        self._pipeline_shape_body = shape_body
+        self._pipeline_particle_radius = particle_radius
+        self._pipeline_shape_margin = shape_margin
 
     def add_collision_energy(self, E: wp.array):
         # if no contacts, return current energy
@@ -293,7 +335,15 @@ class CollisionHandler:
         normals = self.collision_normals # contact normal
         kinematic_gaps = self.collision_kinematic_gaps # gap between soft body and ground/kinematic meshes
 
-        self.run_collision_detectors( # runs the actual collision detection kernels 
+        self.run_collision_detectors( # runs the actual collision detection kernels
+            dt,
+            count,
+            indices_a,
+            indices_b,
+            normals,
+            kinematic_gaps,
+        )
+        self._ingest_pipeline_contacts(
             dt,
             count,
             indices_a,
@@ -390,6 +440,75 @@ class CollisionHandler:
                     indices_b,
                 ],
             )
+
+    def _ingest_pipeline_contacts(
+        self,
+        dt,
+        count,
+        indices_a,
+        indices_b,
+        normals,
+        kinematic_gaps,
+    ):
+        """Append CollisionPipeline particle-shape contacts onto the FEM contact buffers.
+
+        Skips edge/face records (``soft_contact_particle < 0``). Particle ids index
+        the original surface-vertex PIC stored in ``_particle_quadrature``.
+        """
+        contacts = self._pipeline_contacts
+        shape_body = self._pipeline_shape_body
+        if contacts is None or shape_body is None or self._particle_quadrature is None:
+            return
+        if self._n_particles <= 0:
+            return
+
+        n_contacts = int(contacts.soft_contact_count.numpy()[0])
+        if n_contacts <= 0:
+            return
+        n_contacts = min(n_contacts, contacts.soft_contact_max)
+
+        pos_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=self.collision_indices_a.device)
+        fem.interpolate(
+            world_position,
+            fields={"u": self.sim.u_field},
+            dest=pos_cur,
+            at=self._particle_quadrature,
+        )
+        du_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=pos_cur.device)
+        fem.interpolate(
+            self.sim.du_field,
+            dest=du_cur,
+            at=self._particle_quadrature,
+        )
+
+        body_q = self._pipeline_body_q
+        if body_q is None:
+            body_q = wp.zeros(1, dtype=wp.transform, device=pos_cur.device)
+
+        wp.launch(
+            ingest_pipeline_particle_contacts,
+            dim=n_contacts,
+            inputs=[
+                self.collision_normals.shape[0],
+                dt,
+                n_contacts,
+                self._n_particles,
+                pos_cur,
+                du_cur,
+                body_q,
+                shape_body,
+                contacts.soft_contact_particle,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_body_vel,
+                contacts.soft_contact_normal,
+                count,
+                normals,
+                kinematic_gaps,
+                indices_a,
+                indices_b,
+            ],
+        )
 
     def build_collision_quadratures(self):
         n_contact = self.n_contact
@@ -740,6 +859,62 @@ def detect_mesh_collisions(
             kinematic_gaps[idx] = kinematic_gap
             indices_a[idx] = tid
             indices_b[idx] = fem.NULL_QP_INDEX
+
+
+@wp.kernel
+def ingest_pipeline_particle_contacts(
+    max_contacts: int,
+    dt: float,
+    n_contacts: int,
+    n_particles: int,
+    pos_cur: wp.array(dtype=wp.vec3),
+    du_cur: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=int),
+    soft_contact_particle: wp.array(dtype=int),
+    soft_contact_shape: wp.array(dtype=int),
+    soft_contact_body_pos: wp.array(dtype=wp.vec3),
+    soft_contact_body_vel: wp.array(dtype=wp.vec3),
+    soft_contact_normal: wp.array(dtype=wp.vec3),
+    count: wp.array(dtype=int),
+    normals: wp.array(dtype=wp.vec3),
+    kinematic_gaps: wp.array(dtype=wp.vec3),
+    indices_a: wp.array(dtype=int),
+    indices_b: wp.array(dtype=int),
+):
+    k = wp.tid()
+    if k >= n_contacts:
+        return
+
+    particle = soft_contact_particle[k]
+    if particle < 0 or particle >= n_particles:
+        return
+
+    shape = soft_contact_shape[k]
+    if shape < 0:
+        return
+
+    n = soft_contact_normal[k]
+    body = shape_body[shape]
+    X_wb = wp.transform_identity()
+    if body >= 0:
+        X_wb = body_q[body]
+
+    bx = wp.transform_point(X_wb, soft_contact_body_pos[k])
+    x = pos_cur[particle]
+    dist = wp.dot(n, x - bx)
+    bv = wp.transform_vector(X_wb, soft_contact_body_vel[k])
+
+    idx = wp.atomic_add(count, 0, 1)
+    if idx >= max_contacts:
+        return
+
+    # Same kinematic-gap convention as detect_mesh_collisions: rest-space
+    # separation along n, minus rigid motion over this step.
+    kinematic_gaps[idx] = (dist - wp.dot(du_cur[particle], n)) * n - bv * dt
+    normals[idx] = n
+    indices_a[idx] = particle
+    indices_b[idx] = fem.NULL_QP_INDEX
 
 
 @wp.kernel

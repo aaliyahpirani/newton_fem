@@ -45,6 +45,10 @@ def fixed_points_projector_form(
 class SolverFEMNewton(SolverBase, CouplingInterface):
     """Implicit Newton FEM solver for volumetric soft bodies.
 
+    Particle-shape contacts come from :class:`~newton.CollisionPipeline` via
+    the ``contacts`` argument of :meth:`step`. Mesh self-collision is handled
+    internally. This solver does not integrate rigid bodies.
+
     .. experimental::
 
     """
@@ -270,8 +274,25 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
     def step(
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ) -> None:
-        del control, contacts
-        # define the simulation object 
+        """Advance the FEM Newton state by one time step.
+
+        Args:
+            state_in: State at the beginning of the time step.
+            state_out: State that receives the interpolated particle positions.
+            control: Unused. Reserved for the :class:`~newton.solvers.SolverBase` interface.
+            contacts: Particle-shape contacts from :meth:`~newton.CollisionPipeline.collide`.
+                If ``None``, that path is skipped. Mesh self-collision is unchanged.
+            dt: Time step size [s].
+        """
+        del control
+        self.collision_handler.set_pipeline_contacts(
+            contacts,
+            body_q=state_in.body_q,
+            shape_body=self.model.shape_body,
+            particle_radius=self.model.particle_radius,
+            shape_margin=self.model.shape_margin,
+        )
+        # define the simulation object
         sim = self.sim
         if sim is None:
             raise RuntimeError("Simulation has not been created; call init_deformable_simulation() first.")
@@ -286,7 +307,7 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             if state_out.particle_qd is not None and state_in.particle_qd is not None:
                 state_out.particle_qd.assign(state_in.particle_qd)
 
-        # interpolate the deformed positions to the surface vertices 
+        # interpolate the deformed positions to the surface vertices
         fem.interpolate(
             deformed_position,
             at=self.surface_vtx_quadrature,
