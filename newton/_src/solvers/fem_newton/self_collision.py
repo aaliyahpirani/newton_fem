@@ -129,6 +129,91 @@ class CollisionHandler:
         self._pipeline_particle_radius = particle_radius
         self._pipeline_shape_margin = shape_margin
 
+    def _sample_particle_world_and_du(self):
+        """Interpolate deformed position and Newton increment at original surface verts."""
+        device = self.collision_indices_a.device
+        pos_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=device)
+        fem.interpolate(
+            world_position,
+            fields={"u": self.sim.u_field},
+            dest=pos_cur,
+            at=self._particle_quadrature,
+        )
+        du_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=device)
+        fem.interpolate(
+            self.sim.du_field,
+            dest=du_cur,
+            at=self._particle_quadrature,
+        )
+        return pos_cur, du_cur
+
+    def harvest_pipeline_contact_wrenches(
+        self,
+        body_local_to_proxy_global: wp.array[int],
+        out_body_f: wp.array[wp.spatial_vector],
+        *,
+        body_q: wp.array[wp.transform] | None,
+        body_com: wp.array[wp.vec3] | None,
+        shape_body: wp.array[int] | None,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Accumulate equal-and-opposite FEM penalty wrenches on proxy bodies.
+
+        Iterates :class:`~newton.Contacts` particle-shape records rather than the
+        mixed FEM contact buffer, so self-collision and the optional FEM ground
+        plane are not harvested. Static shapes (``shape_body == -1``) are skipped.
+
+        Args:
+            body_local_to_proxy_global: Destination-local body id to global proxy
+                id, or ``-1`` if the body is not a proxy. Shape [body_count].
+            out_body_f: Coupling wrenches [N, N·m], shape [global proxy count].
+            body_q: Body transforms [m, unitless], shape [body_count].
+            body_com: Body COM in the body frame [m], shape [body_count].
+            shape_body: Parent body index per shape, shape [shape_count].
+            contacts: Soft-rigid contact buffer, or ``None``.
+            dt: Time step size [s].
+        """
+        out_body_f.zero_()
+        if (
+            contacts is None
+            or body_q is None
+            or body_com is None
+            or shape_body is None
+            or self._particle_quadrature is None
+            or self._n_particles <= 0
+            or contacts.soft_contact_max <= 0
+        ):
+            return
+
+        pos_cur, du_cur = self._sample_particle_world_and_du()
+        wp.launch(
+            harvest_pipeline_particle_contact_wrenches,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                dt,
+                dt * self.sim.friction_reg,
+                self.sim.friction_fluid * self.sim.friction_reg,
+                self.sim.collision_radius,
+                self.sim.friction,
+                self._collision_stiffness,
+                self._n_particles,
+                pos_cur,
+                du_cur,
+                body_q,
+                body_com,
+                shape_body,
+                body_local_to_proxy_global,
+                contacts.soft_contact_count,
+                contacts.soft_contact_particle,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_body_vel,
+                contacts.soft_contact_normal,
+                out_body_f,
+            ],
+        )
+
     def add_collision_energy(self, E: wp.array):
         # if no contacts, return current energy
         if self.n_contact == 0:
@@ -467,19 +552,7 @@ class CollisionHandler:
             return
         n_contacts = min(n_contacts, contacts.soft_contact_max)
 
-        pos_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=self.collision_indices_a.device)
-        fem.interpolate(
-            world_position,
-            fields={"u": self.sim.u_field},
-            dest=pos_cur,
-            at=self._particle_quadrature,
-        )
-        du_cur = wp.empty(self._n_particles, dtype=wp.vec3, device=pos_cur.device)
-        fem.interpolate(
-            self.sim.du_field,
-            dest=du_cur,
-            at=self._particle_quadrature,
-        )
+        pos_cur, du_cur = self._sample_particle_world_and_du()
 
         body_q = self._pipeline_body_q
         if body_q is None:
@@ -917,6 +990,89 @@ def ingest_pipeline_particle_contacts(
     indices_b[idx] = fem.NULL_QP_INDEX
 
 
+@wp.func
+def collision_energy_gradient(
+    offset: wp.vec3,
+    nor: wp.vec3,
+    rc: float,
+    mu: float,
+    dt: float,
+    nu: float,
+):
+    """World-space gradient of one kinematic contact energy wrt the gap offset."""
+    d = wp.dot(offset, nor)
+    d_hat = d / rc
+    stick = wp.where(d_hat < 1.0, 1.0, 0.0)
+    dE_d_hat = d_hat - 1.0
+    g = dE_d_hat * stick / rc * nor
+
+    vt = (offset - d * nor) / dt
+    vt_norm = wp.length(vt)
+    mu_fn = -mu * wp.min(0.0, dE_d_hat) / rc
+    f1_over_vt_norm = wp.where(vt_norm < 1.0, 2.0 - vt_norm, 1.0 / vt_norm)
+    return g + mu_fn * (f1_over_vt_norm + nu) * vt
+
+
+@wp.kernel
+def harvest_pipeline_particle_contact_wrenches(
+    dt: float,
+    friction_dt: float,
+    nu: float,
+    radius: float,
+    mu: float,
+    stiffness: float,
+    n_particles: int,
+    pos_cur: wp.array(dtype=wp.vec3),
+    du_cur: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    shape_body: wp.array(dtype=int),
+    body_local_to_proxy_global: wp.array(dtype=int),
+    soft_contact_count: wp.array(dtype=int),
+    soft_contact_particle: wp.array(dtype=int),
+    soft_contact_shape: wp.array(dtype=int),
+    soft_contact_body_pos: wp.array(dtype=wp.vec3),
+    soft_contact_body_vel: wp.array(dtype=wp.vec3),
+    soft_contact_normal: wp.array(dtype=wp.vec3),
+    out_body_f: wp.array(dtype=wp.spatial_vector),
+):
+    k = wp.tid()
+    if k >= soft_contact_count[0]:
+        return
+
+    particle = soft_contact_particle[k]
+    if particle < 0 or particle >= n_particles:
+        return
+
+    shape = soft_contact_shape[k]
+    if shape < 0:
+        return
+
+    body = shape_body[shape]
+    if body < 0 or body >= body_local_to_proxy_global.shape[0]:
+        return
+
+    proxy_global = body_local_to_proxy_global[body]
+    if proxy_global < 0 or proxy_global >= out_body_f.shape[0]:
+        return
+
+    n = soft_contact_normal[k]
+    X_wb = body_q[body]
+    bx = wp.transform_point(X_wb, soft_contact_body_pos[k])
+    bv = wp.transform_vector(X_wb, soft_contact_body_vel[k])
+    du = du_cur[particle]
+    dist = wp.dot(n, pos_cur[particle] - bx)
+    # Same kinematic gap as ingest / detect_mesh_collisions.
+    kinematic_gap = (dist - wp.dot(du, n)) * n - bv * dt
+    offset = du + kinematic_gap
+    gradient = collision_energy_gradient(offset, n, radius, mu, friction_dt, nu)
+
+    force_on_body = stiffness * gradient
+    com_world = wp.transform_point(X_wb, body_com[body])
+    torque_on_body = wp.cross(bx - com_world, force_on_body)
+    wp.atomic_add(out_body_f, proxy_global, wp.spatial_vector(force_on_body, torque_on_body))
+
+
 @wp.kernel
 def detect_mesh_self_collisions(
     cur_contacts: int,
@@ -1123,7 +1279,7 @@ def collision_gradient_and_hessian(
     stick = wp.where(d_hat < 1.0, 1.0, 0.0)
 
     dE_d_hat = d_hat - 1.0
-    gradient[c] = dE_d_hat * stick / rc * nor
+    gradient[c] = collision_energy_gradient(offset, nor, rc, mu, dt, nu)
     hessian[c] = wp.outer(nor, nor) * stick / (rc * rc)
 
     vt = (offset - d * nor) / dt  # tangential velocity
@@ -1131,9 +1287,7 @@ def collision_gradient_and_hessian(
     vt_dir = wp.normalize(vt)  # avoids dealing with 0
 
     mu_fn = -mu * wp.min(0.0, dE_d_hat) / rc  # yield force
-
     f1_over_vt_norm = wp.where(vt_norm < 1.0, 2.0 - vt_norm, 1.0 / vt_norm)
-    gradient[c] += mu_fn * (f1_over_vt_norm + nu) * vt
 
     # regularization such that f / H dt <= k v (penalizes friction switching dir)
     friction_slip_reg = 0.1

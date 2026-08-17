@@ -47,7 +47,8 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
 
     Particle-shape contacts come from :class:`~newton.CollisionPipeline` via
     the ``contacts`` argument of :meth:`step`. Mesh self-collision is handled
-    internally. This solver does not integrate rigid bodies.
+    internally. This solver does not integrate rigid bodies. Proxy-body
+    reactions are reported by :meth:`coupling_harvest_proxy_wrenches`.
 
     .. experimental::
 
@@ -313,4 +314,46 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             at=self.surface_vtx_quadrature,
             dest=state_out.particle_q,
             fields={"displacement": sim.u_field},
+        )
+
+    def coupling_harvest_proxy_wrenches(
+        self,
+        body_local_to_proxy_global: wp.array[int],
+        out_body_f: wp.array[wp.spatial_vector],
+        *,
+        body_qd_before: wp.array[wp.spatial_vector],
+        state: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Harvest FEM particle-shape penalty forces onto proxy bodies.
+
+        FEM does not integrate rigid bodies, so the generic momentum harvest
+        would be identically zero. This evaluates the same contact gradient
+        used in the Newton residual and applies the equal-and-opposite wrench.
+
+        Args:
+            body_local_to_proxy_global: Destination-local body id to global proxy
+                id, or ``-1``. Shape [body_count].
+            out_body_f: Coupling wrenches [N, N·m], shape [global proxy count].
+            body_qd_before: Unused. FEM does not update ``body_qd``.
+            state: Unused. Pose is taken from ``state_out``.
+            state_out: Destination state after :meth:`step`.
+            contacts: Particle-shape contacts from :meth:`~newton.CollisionPipeline.collide`.
+                If ``None``, ``out_body_f`` is zeroed and the call returns.
+            dt: Time step size [s].
+        """
+        del body_qd_before, state
+        if dt <= 0.0:
+            raise ValueError("FEM proxy harvest requires dt > 0")
+        body_q = state_out.body_q if state_out.body_q is not None else self.model.body_q
+        self.collision_handler.harvest_pipeline_contact_wrenches(
+            body_local_to_proxy_global,
+            out_body_f,
+            body_q=body_q,
+            body_com=self.model.body_com,
+            shape_body=self.model.shape_body,
+            contacts=contacts,
+            dt=dt,
         )

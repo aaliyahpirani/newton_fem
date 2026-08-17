@@ -73,6 +73,132 @@ def test_fem_newton_pipeline_particle_contacts(test, device):
     test.assertGreater(solver.collision_handler.n_contact, 0)
 
 
+def _make_fem_proxy_harvest_model(device):
+    """Build a small FEM grid against one dynamic box for harvest tests."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.add_soft_grid(
+        pos=wp.vec3(-0.1, -0.1, 0.12),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=2,
+        dim_y=2,
+        dim_z=2,
+        cell_x=0.1,
+        cell_y=0.1,
+        cell_z=0.1,
+        density=1.0,
+        k_mu=1.0e2,
+        k_lambda=1.0e2,
+        k_damp=0.0,
+        particle_radius=0.05,
+    )
+    inertia = wp.mat33(1.0e-2, 0.0, 0.0, 0.0, 1.0e-2, 0.0, 0.0, 0.0, 1.0e-2)
+    builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()), mass=1.0, inertia=inertia)
+    builder.add_shape_box(body=0, hx=0.5, hy=0.5, hz=0.05)
+    return builder.finalize(device=device)
+
+
+def _make_fem_proxy_solver(model):
+    """Create a rest-pose FEM Newton solver with frictionless kinematic contacts."""
+    return newton.solvers.SolverFEMNewton(
+        model=model,
+        resolution=8,
+        up_axis=2,
+        gravity=0.0,
+        young_modulus=10.0,
+        poisson_ratio=0.1,
+        density=1.0,
+        dt=1.0 / 30.0,
+        n_newton=1,
+        cg_iters=5,
+        y_min=-2.0,
+        y_max=2.0,
+        quiet=True,
+        ground=False,
+        friction=0.0,
+        collision_stiffness=1.0,
+    )
+
+
+def test_fem_newton_harvest_pipeline_contact_wrench(test, device):
+    """Harvest equal-and-opposite FEM penalty force onto a mapped proxy body."""
+    model = _make_fem_proxy_harvest_model(device)
+    solver = _make_fem_proxy_solver(model)
+    state = model.state()
+    dt = 1.0 / 30.0
+    dist = -0.02
+    normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    particle_x = model.particle_q.numpy()[0]
+    body_pos = particle_x - dist * normal
+
+    contacts = newton.Contacts(0, 8, device=device)
+    contacts.soft_contact_count.assign([1])
+    particle = contacts.soft_contact_particle.numpy()
+    particle[0] = 0
+    contacts.soft_contact_particle.assign(particle)
+    shape = contacts.soft_contact_shape.numpy()
+    shape[0] = 0
+    contacts.soft_contact_shape.assign(shape)
+    body_pos_arr = contacts.soft_contact_body_pos.numpy()
+    body_pos_arr[0] = body_pos
+    contacts.soft_contact_body_pos.assign(body_pos_arr)
+    n_arr = contacts.soft_contact_normal.numpy()
+    n_arr[0] = normal
+    contacts.soft_contact_normal.assign(n_arr)
+
+    out_body_f = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    solver.coupling_harvest_proxy_wrenches(
+        wp.array([0], dtype=int, device=device),
+        out_body_f,
+        body_qd_before=wp.zeros(1, dtype=wp.spatial_vector, device=device),
+        state=state,
+        state_out=state,
+        contacts=contacts,
+        dt=dt,
+    )
+
+    wrench = out_body_f.numpy()[0]
+    force, torque = wrench[:3], wrench[3:]
+    rc = 0.5 / 8.0
+    stiffness = 1.0 * 1.0 / float(model.particle_count)
+    d_hat = dist / rc
+    expected_force = stiffness * (d_hat - 1.0) / rc * normal
+    com = model.body_com.numpy()[0]
+    expected_torque = np.cross(body_pos - com, expected_force)
+    np.testing.assert_allclose(force, expected_force, rtol=2e-4, atol=1e-4)
+    np.testing.assert_allclose(torque, expected_torque, rtol=2e-4, atol=1e-5)
+
+
+def test_fem_newton_harvest_skips_unmapped_bodies(test, device):
+    """Skip particle-shape contacts whose body is not a coupling proxy."""
+    model = _make_fem_proxy_harvest_model(device)
+    solver = _make_fem_proxy_solver(model)
+    state = model.state()
+    contacts = newton.Contacts(0, 8, device=device)
+    contacts.soft_contact_count.assign([1])
+    particle = contacts.soft_contact_particle.numpy()
+    particle[0] = 0
+    contacts.soft_contact_particle.assign(particle)
+    shape = contacts.soft_contact_shape.numpy()
+    shape[0] = 0
+    contacts.soft_contact_shape.assign(shape)
+    n_arr = contacts.soft_contact_normal.numpy()
+    n_arr[0] = [0.0, 0.0, 1.0]
+    contacts.soft_contact_normal.assign(n_arr)
+
+    out_body_f = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    solver.coupling_harvest_proxy_wrenches(
+        wp.array([-1], dtype=int, device=device),
+        out_body_f,
+        body_qd_before=wp.zeros(1, dtype=wp.spatial_vector, device=device),
+        state=state,
+        state_out=state,
+        contacts=contacts,
+        dt=1.0 / 30.0,
+    )
+    np.testing.assert_allclose(out_body_f.numpy()[0], np.zeros(6), atol=1e-8)
+
+
 class TestSolverFEMNewton(unittest.TestCase):
     pass
 
@@ -82,6 +208,18 @@ add_function_test(
     TestSolverFEMNewton,
     "test_fem_newton_pipeline_particle_contacts",
     test_fem_newton_pipeline_particle_contacts,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEMNewton,
+    "test_fem_newton_harvest_pipeline_contact_wrench",
+    test_fem_newton_harvest_pipeline_contact_wrench,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEMNewton,
+    "test_fem_newton_harvest_skips_unmapped_bodies",
+    test_fem_newton_harvest_skips_unmapped_bodies,
     devices=devices,
 )
 
