@@ -66,11 +66,13 @@ class CollisionHandler:
         self.set_collision_quadrature(collision_quadrature)
         self.n_contact = 0
 
-        max_contacts = 10 * self.cp_cell_indices.shape[0]
+        # Self-collision can report many face hits per quadrature point.
+        max_contacts = 128 * self.cp_cell_indices.shape[0]
         self.collision_indices_a = wp.empty(max_contacts, dtype=int)
         self.collision_indices_b = wp.empty(max_contacts, dtype=int)
         self.collision_normals = wp.empty(max_contacts, dtype=wp.vec3)
         self.collision_kinematic_gaps = wp.empty(max_contacts, dtype=wp.vec3)
+        self._warned_contact_overflow = False
 
         jac_cols = sim.u_field.space_partition.node_count()
         self._collision_jacobian_a = sp.bsr_zeros(0, jac_cols, block_type=wp.mat33)
@@ -304,8 +306,10 @@ class CollisionHandler:
 
         self.n_contact = int(count.numpy()[0]) # update the number of contacts
 
-        if self.n_contact > max_contacts: # if above buffer capacity, some contacts will be ignored 
-            print("Warning: contact buffer size exceeded, some have bee ignored")
+        if self.n_contact > max_contacts:  # if above buffer capacity, some contacts will be ignored
+            if not self._warned_contact_overflow:
+                print("Warning: contact buffer size exceeded, some have been ignored")
+                self._warned_contact_overflow = True
             self.n_contact = max_contacts
 
     def run_collision_detectors(

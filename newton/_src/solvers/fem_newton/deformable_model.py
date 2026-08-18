@@ -288,12 +288,13 @@ class Deformable:
             * np.array([poisson_ratio / (1.0 - 2.0 * poisson_ratio), 0.5])
         )
 
-        typical_length = 1.0
+        # Characteristic length of the background FEM domain ([-1, 1]^3).
+        self.typical_length = 1.0
         self.typical_stiffness = max(
-            density * gravity * typical_length,
+            density * gravity * self.typical_length,
             min(
                 young_modulus,  # handle no-gravity, quasistatic case
-                density * typical_length**2 / (dt**2),  # handle no-gravity, dynamic case
+                density * self.typical_length**2 / (dt**2),  # handle no-gravity, dynamic case
             ),
         )
 
