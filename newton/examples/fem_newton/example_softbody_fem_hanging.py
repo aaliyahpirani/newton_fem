@@ -4,10 +4,11 @@
 ###########################################################################
 # Example Softbody FEM Hanging
 #
-# Experimental classic FEM Newton soft body. A soft cube sits inside the
-# solver's [-1, 1]^3 background grid; nodes above a Z clamp are fixed so the
-# cube hangs and sags under gravity onto the ground plane. Particle-shape
-# contacts come from CollisionPipeline; FEM self-collision stays internal.
+# Experimental classic FEM Newton soft body. A free soft cube sits inside the
+# solver's [-1, 1]^3 background grid and rests on the ground plane.
+# Particle-shape contacts come from CollisionPipeline; FEM self-collision
+# stays internal. FEM ground is off so Newton particle-shape contacts against
+# the plane provide the reaction.
 #
 # Command: uv run -m newton.examples softbody_fem_hanging
 #
@@ -20,7 +21,7 @@ import newton.examples
 
 
 class Example:
-    """Hang a soft cube with the experimental FEM Newton solver."""
+    """Rest a soft cube on the ground with the experimental FEM Newton solver."""
 
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -34,15 +35,19 @@ class Example:
         # Match Newton viewer convention (Z up) with the FEM grid domain.
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Soft cube inside [-1, 1]^3. Top slab is clamped by axis_max below.
-        cell = 0.08 # edge length of one voxel
-        dim = 8 # number of elements along each axis so it is 8x8x8 cells
-        extent = dim * cell # full side length of each cube
-        # Center in XY, hang from near the top of the FEM domain.
-        z0 = 0.15
+        # Soft cube inside [-1, 1]^3. No Dirichlet clamp; it sits on the ground.
+        cell = 0.08  # edge length of one voxel
+        dim = 8  # number of elements along each axis so it is 8x8x8 cells
+        extent = dim * cell  # full side length of the cube
         # Match SolverFEMNewton's default collision_radius = 0.5 / resolution so
         # pipeline detection and the FEM penalty see the same particle size.
         particle_radius = 0.5 / float(args.resolution)
+
+        # Infinite ground under the cube so it does not fall through the domain.
+        builder.add_ground_plane()
+
+        # Center in XY, a short drop above the ground plane.
+        z0 = 0.04
         builder.add_soft_grid(
             pos=wp.vec3(-0.5 * extent, -0.5 * extent, z0),
             rot=wp.quat_identity(),
@@ -60,15 +65,10 @@ class Example:
             particle_radius=particle_radius,
         )
 
-        # Infinite ground under the cube. FEM ground=False so Newton particle-shape
-        # contacts against this plane generate the reaction, not the built-in plane.
-        builder.add_ground_plane()
-
         self.model = builder.finalize()
 
-        # Clamp FEM nodes above this Z (pins the top of the cube).
         # SolverFEMNewton.gravity is a positive magnitude; acceleration is -g * up.
-        axis_max = z0 + extent - 2.0 * cell
+        # Bounds sit outside [-1, 1]^3: nothing is Dirichlet-clamped.
         self.solver = newton.solvers.SolverFEMNewton(
             model=self.model,
             resolution=args.resolution,
@@ -81,7 +81,7 @@ class Example:
             n_newton=args.newton_iters,
             cg_iters=args.cg_iters,
             y_min=-2.0,
-
+            y_max=2.0,
             quiet=True,
             ground=False,
         )
@@ -96,7 +96,7 @@ class Example:
         self.viewer.set_model(self.model)
         if hasattr(self.viewer, "set_camera"):
             # Frame the small cube near the origin.
-            self.viewer.set_camera(pos=wp.vec3(1.6, -1.6, 0.7), pitch=-15.0, yaw=135.0)
+            self.viewer.set_camera(pos=wp.vec3(1.8, -1.8, 0.9), pitch=-20.0, yaw=135.0)
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -111,7 +111,7 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
-        # Free end should sag below the rest z-min while the clamped top stays put.
+        # Cube should remain near the FEM domain while sitting on the ground.
         p_lower = wp.vec3(-1.0, -1.0, -1.0)
         p_upper = wp.vec3(1.0, 1.0, 1.0)
         newton.examples.test_particle_state(
