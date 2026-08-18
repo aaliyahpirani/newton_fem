@@ -45,6 +45,11 @@ def fixed_points_projector_form(
 class SolverFEMNewton(SolverBase, CouplingInterface):
     """Implicit Newton FEM solver for volumetric soft bodies.
 
+    Particle-shape contacts come from :class:`~newton.CollisionPipeline` via
+    the ``contacts`` argument of :meth:`step`. Mesh self-collision is handled
+    internally. This solver does not integrate rigid bodies. Proxy-body
+    reactions are reported by :meth:`coupling_harvest_proxy_wrenches`.
+
     .. experimental::
 
     """
@@ -270,8 +275,25 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
     def step(
         self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ) -> None:
-        del control, contacts
-        # define the simulation object 
+        """Advance the FEM Newton state by one time step.
+
+        Args:
+            state_in: State at the beginning of the time step.
+            state_out: State that receives the interpolated particle positions.
+            control: Unused. Reserved for the :class:`~newton.solvers.SolverBase` interface.
+            contacts: Particle-shape contacts from :meth:`~newton.CollisionPipeline.collide`.
+                If ``None``, that path is skipped. Mesh self-collision is unchanged.
+            dt: Time step size [s].
+        """
+        del control
+        self.collision_handler.set_pipeline_contacts(
+            contacts,
+            body_q=state_in.body_q,
+            shape_body=self.model.shape_body,
+            particle_radius=self.model.particle_radius,
+            shape_margin=self.model.shape_margin,
+        )
+        # define the simulation object
         sim = self.sim
         if sim is None:
             raise RuntimeError("Simulation has not been created; call init_deformable_simulation() first.")
@@ -286,10 +308,52 @@ class SolverFEMNewton(SolverBase, CouplingInterface):
             if state_out.particle_qd is not None and state_in.particle_qd is not None:
                 state_out.particle_qd.assign(state_in.particle_qd)
 
-        # interpolate the deformed positions to the surface vertices 
+        # interpolate the deformed positions to the surface vertices
         fem.interpolate(
             deformed_position,
             at=self.surface_vtx_quadrature,
             dest=state_out.particle_q,
             fields={"displacement": sim.u_field},
+        )
+
+    def coupling_harvest_proxy_wrenches(
+        self,
+        body_local_to_proxy_global: wp.array[int],
+        out_body_f: wp.array[wp.spatial_vector],
+        *,
+        body_qd_before: wp.array[wp.spatial_vector],
+        state: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Harvest FEM particle-shape penalty forces onto proxy bodies.
+
+        FEM does not integrate rigid bodies, so the generic momentum harvest
+        would be identically zero. This evaluates the same contact gradient
+        used in the Newton residual and applies the equal-and-opposite wrench.
+
+        Args:
+            body_local_to_proxy_global: Destination-local body id to global proxy
+                id, or ``-1``. Shape [body_count].
+            out_body_f: Coupling wrenches [N, N·m], shape [global proxy count].
+            body_qd_before: Unused. FEM does not update ``body_qd``.
+            state: Unused. Pose is taken from ``state_out``.
+            state_out: Destination state after :meth:`step`.
+            contacts: Particle-shape contacts from :meth:`~newton.CollisionPipeline.collide`.
+                If ``None``, ``out_body_f`` is zeroed and the call returns.
+            dt: Time step size [s].
+        """
+        del body_qd_before, state
+        if dt <= 0.0:
+            raise ValueError("FEM proxy harvest requires dt > 0")
+        body_q = state_out.body_q if state_out.body_q is not None else self.model.body_q
+        self.collision_handler.harvest_pipeline_contact_wrenches(
+            body_local_to_proxy_global,
+            out_body_f,
+            body_q=body_q,
+            body_com=self.model.body_com,
+            shape_body=self.model.shape_body,
+            contacts=contacts,
+            dt=dt,
         )

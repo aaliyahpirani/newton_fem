@@ -6,7 +6,8 @@
 #
 # Experimental classic FEM Newton soft body. A soft cube sits inside the
 # solver's [-1, 1]^3 background grid; nodes above a Z clamp are fixed so the
-# cube hangs and sags under gravity.
+# cube hangs and sags under gravity onto a static box. Particle-shape
+# contacts come from CollisionPipeline; FEM self-collision stays internal.
 #
 # Command: uv run -m newton.examples softbody_fem_hanging
 #
@@ -39,6 +40,9 @@ class Example:
         extent = dim * cell
         # Center in XY, hang from near the top of the FEM domain.
         z0 = 0.15
+        # Match SolverFEMNewton's default collision_radius = 0.5 / resolution so
+        # pipeline detection and the FEM penalty see the same particle size.
+        particle_radius = 0.5 / float(args.resolution)
         builder.add_soft_grid(
             pos=wp.vec3(-0.5 * extent, -0.5 * extent, z0),
             rot=wp.quat_identity(),
@@ -53,6 +57,17 @@ class Example:
             k_mu=1.0e2,
             k_lambda=1.0e2,
             k_damp=0.0,
+            particle_radius=particle_radius,
+        )
+
+        # Static floor under the cube. FEM ground=False so Newton particle-shape
+        # contacts are what generate the reaction, not the built-in plane.
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
+            hx=1.0,
+            hy=1.0,
+            hz=0.05,
         )
 
         self.model = builder.finalize()
@@ -80,6 +95,8 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
         self.graph = None
 
         self.viewer.set_model(self.model)
@@ -91,7 +108,8 @@ class Example:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
-            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
