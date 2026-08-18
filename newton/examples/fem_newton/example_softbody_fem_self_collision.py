@@ -163,7 +163,7 @@ class Example:
             up_axis=2,
             gravity=args.gravity,
             young_modulus=args.young_modulus,
-            poisson_ratio=0.1,
+            poisson_ratio=0.45,
             density=1.0,
             dt=self.sim_dt,
             n_newton=args.newton_iters,
@@ -223,7 +223,7 @@ class Example:
         parser.add_argument(
             "--young-modulus",
             type=float,
-            default=10.0,
+            default=150.0,
             help="Young modulus [Pa] (keep soft so the arch collapses)",
         )
         parser.add_argument(

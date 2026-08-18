@@ -6,7 +6,7 @@
 #
 # Experimental classic FEM Newton soft body. A soft cube sits inside the
 # solver's [-1, 1]^3 background grid; nodes above a Z clamp are fixed so the
-# cube hangs and sags under gravity onto a static box. Particle-shape
+# cube hangs and sags under gravity onto the ground plane. Particle-shape
 # contacts come from CollisionPipeline; FEM self-collision stays internal.
 #
 # Command: uv run -m newton.examples softbody_fem_hanging
@@ -35,9 +35,9 @@ class Example:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
         # Soft cube inside [-1, 1]^3. Top slab is clamped by axis_max below.
-        cell = 0.08
-        dim = 8
-        extent = dim * cell
+        cell = 0.08 # edge length of one voxel
+        dim = 8 # number of elements along each axis so it is 8x8x8 cells
+        extent = dim * cell # full side length of each cube
         # Center in XY, hang from near the top of the FEM domain.
         z0 = 0.15
         # Match SolverFEMNewton's default collision_radius = 0.5 / resolution so
@@ -60,15 +60,9 @@ class Example:
             particle_radius=particle_radius,
         )
 
-        # Static floor under the cube. FEM ground=False so Newton particle-shape
-        # contacts are what generate the reaction, not the built-in plane.
-        builder.add_shape_box(
-            body=-1,
-            xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()),
-            hx=1.0,
-            hy=1.0,
-            hz=0.05,
-        )
+        # Infinite ground under the cube. FEM ground=False so Newton particle-shape
+        # contacts against this plane generate the reaction, not the built-in plane.
+        builder.add_ground_plane()
 
         self.model = builder.finalize()
 
@@ -81,13 +75,13 @@ class Example:
             up_axis=2,
             gravity=args.gravity,
             young_modulus=args.young_modulus,
-            poisson_ratio=0.1,
+            poisson_ratio=args.poisson_ratio,
             density=1.0,
             dt=self.sim_dt,
             n_newton=args.newton_iters,
             cg_iters=args.cg_iters,
             y_min=-2.0,
-            y_max=axis_max,
+
             quiet=True,
             ground=False,
         )
@@ -134,19 +128,25 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
-        parser.add_argument("--resolution", type=int, default=24, help="Background FEM grid resolution")
-        parser.add_argument("--newton-iters", type=int, default=3, help="Newton iterations per frame")
-        parser.add_argument("--cg-iters", type=int, default=150, help="Linear CG iterations per Newton step")
+        parser.add_argument("--resolution", type=int, default=64, help="Background FEM grid resolution")
+        parser.add_argument("--newton-iters", type=int, default=2, help="Newton iterations per frame")
+        parser.add_argument("--cg-iters", type=int, default=250, help="Linear CG iterations per Newton step")
         parser.add_argument(
             "--young-modulus",
             type=float,
             default=10.0,
-            help="Young modulus [Pa] (keep soft so sag is visible)",
+            help="Young modulus [Pa]",
+        )
+        parser.add_argument(
+            "--poisson-ratio",
+            type=float,
+            default=0.45,
+            help="Poisson ratio",
         )
         parser.add_argument(
             "--gravity",
             type=float,
-            default=20.0,
+            default=1.0,
             help="Gravity magnitude (positive); acceleration is -g along up_axis",
         )
         return parser
