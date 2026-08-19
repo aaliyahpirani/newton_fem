@@ -1218,6 +1218,13 @@ add_example_test(
     test_options_cpu={"num-frames": 2},
     use_viewer=True,
 )
+add_example_test(
+    TestSoftbodyExamples,
+    name="softbody.example_softbody_fem_hanging",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 2, "newton-iters": 1, "cg-iters": 5, "resolution": 8},
+    use_viewer=True,
+)
 
 
 class TestKaminoExamples(unittest.TestCase):

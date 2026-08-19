@@ -7,8 +7,10 @@ import unittest
 
 import numpy as np
 import warp as wp
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 import newton
+from newton.solvers import SolverMuJoCo
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -199,6 +201,104 @@ def test_fem_newton_harvest_skips_unmapped_bodies(test, device):
     np.testing.assert_allclose(out_body_f.numpy()[0], np.zeros(6), atol=1e-8)
 
 
+def test_fem_newton_mujoco_coupled_sphere_reacts(test, device):
+    """A penetrating dynamic sphere should be pushed back through MuJoCo body_f."""
+    newton.use_coord_layout_targets = True
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.add_soft_grid(
+        pos=wp.vec3(-0.1, -0.1, 0.12),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        dim_x=2,
+        dim_y=2,
+        dim_z=2,
+        cell_x=0.1,
+        cell_y=0.1,
+        cell_z=0.1,
+        density=1.0,
+        k_mu=1.0e2,
+        k_lambda=1.0e2,
+        k_damp=0.0,
+        particle_radius=0.05,
+    )
+    sphere_radius = 0.08
+    sphere_xform = wp.transform(wp.vec3(0.0, 0.0, 0.36), wp.quat_identity())
+    sphere_body = builder.add_link(xform=sphere_xform, label="sphere")
+    sphere_joint = builder.add_joint_free(child=sphere_body, label="sphere_free")
+    builder.add_articulation([sphere_joint], label="sphere")
+    builder.add_shape_sphere(
+        sphere_body,
+        radius=sphere_radius,
+        cfg=newton.ModelBuilder.ShapeConfig(density=50.0),
+    )
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    newton.eval_fk(model, model.joint_q, model.joint_qd, model)
+
+    fem_kwargs = {
+        "resolution": 8,
+        "up_axis": 2,
+        "gravity": 0.0,
+        "young_modulus": 10.0,
+        "poisson_ratio": 0.1,
+        "density": 1.0,
+        "dt": 1.0 / 30.0,
+        "n_newton": 2,
+        "cg_iters": 20,
+        "y_min": -2.0,
+        "y_max": 2.0,
+        "quiet": True,
+        "ground": False,
+        "friction": 0.0,
+        "collision_stiffness": 10.0,
+    }
+    coupled = SolverCoupledProxy(
+        model=model,
+        entries=[
+            SolverCoupledProxy.Entry(
+                name="mjc",
+                solver=lambda v: SolverMuJoCo(model=v, use_mujoco_contacts=False, njmax=32),
+                bodies=[sphere_body],
+                joints=[sphere_joint],
+            ),
+            SolverCoupledProxy.Entry(
+                name="fem",
+                solver=lambda v, kwargs=fem_kwargs: newton.solvers.SolverFEMNewton(model=v, **kwargs),
+                particles=list(range(model.particle_count)),
+            ),
+        ],
+        coupling=SolverCoupledProxy.Config(
+            proxies=[
+                SolverCoupledProxy.Proxy(
+                    source="mjc",
+                    destination="fem",
+                    bodies=[sphere_body],
+                    collision_pipeline=lambda view: newton.CollisionPipeline(view, soft_contact_margin=0.05),
+                    collide_interval=1,
+                )
+            ],
+            iterations=1,
+        ),
+    )
+
+    pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+    contacts = pipeline.contacts()
+    state_in = model.state()
+    state_out = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+    control = model.control()
+    dt = 1.0 / 30.0
+
+    for _ in range(3):
+        state_in.clear_forces()
+        pipeline.collide(state_in, contacts)
+        coupled.step(state_in, state_out, control, contacts, dt)
+        state_in, state_out = state_out, state_in
+
+    vz = float(state_in.body_qd.numpy()[sphere_body, 2])
+    test.assertGreater(vz, 0.0, f"sphere should be pushed up by FEM contact, got vz={vz}")
+
+
 class TestSolverFEMNewton(unittest.TestCase):
     pass
 
@@ -220,6 +320,12 @@ add_function_test(
     TestSolverFEMNewton,
     "test_fem_newton_harvest_skips_unmapped_bodies",
     test_fem_newton_harvest_skips_unmapped_bodies,
+    devices=devices,
+)
+add_function_test(
+    TestSolverFEMNewton,
+    "test_fem_newton_mujoco_coupled_sphere_reacts",
+    test_fem_newton_mujoco_coupled_sphere_reacts,
     devices=devices,
 )
 
