@@ -29,7 +29,7 @@ from newton.solvers import SolverMuJoCo
 
 
 class Example:
-    """Hang a soft cube with the experimental FEM Newton solver."""
+    """Rest a soft cube on the ground with the experimental FEM Newton solver."""
 
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -45,15 +45,19 @@ class Example:
         # Match Newton viewer convention (Z up) with the FEM grid domain.
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Soft cube inside [-1, 1]^3. Top slab is clamped by axis_max below.
-        cell = 0.08
-        dim = 8
-        extent = dim * cell
-        # Center in XY, hang from near the top of the FEM domain.
-        z0 = 0.15
+        # Soft cube inside [-1, 1]^3. No Dirichlet clamp; it sits on the ground.
+        cell = 0.08  # edge length of one voxel
+        dim = 8  # number of elements along each axis so it is 8x8x8 cells
+        extent = dim * cell  # full side length of the cube
         # Match SolverFEMNewton's default collision_radius = 0.5 / resolution so
         # pipeline detection and the FEM penalty see the same particle size.
         particle_radius = 0.5 / float(args.resolution)
+
+        # Infinite ground under the cube so it does not fall through the domain.
+        builder.add_ground_plane()
+
+        # Center in XY, a short drop above the ground plane.
+        z0 = 0.04
         builder.add_soft_grid(
             pos=wp.vec3(-0.5 * extent, -0.5 * extent, z0),
             rot=wp.quat_identity(),
@@ -106,7 +110,6 @@ class Example:
         self.sphere_body = sphere_body
         self.particle_radius = particle_radius
 
-        # Clamp FEM nodes above this Z (pins the top of the cube).
         # SolverFEMNewton.gravity is a positive magnitude; acceleration is -g * up.
         axis_max = z0 + extent - 2.0 * cell
         fem_kwargs = {
@@ -196,7 +199,7 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
-        # Free end should sag below the rest z-min while the clamped top stays put.
+        # Cube should remain near the FEM domain while sitting on the ground.
         p_lower = wp.vec3(-1.0, -1.0, -1.0)
         p_upper = wp.vec3(1.0, 1.0, 1.0)
         newton.examples.test_particle_state(
@@ -231,12 +234,18 @@ class Example:
             "--young-modulus",
             type=float,
             default=10.0,
-            help="Young modulus [Pa] (keep soft so sag is visible)",
+            help="Young modulus [Pa]",
+        )
+        parser.add_argument(
+            "--poisson-ratio",
+            type=float,
+            default=0.45,
+            help="Poisson ratio",
         )
         parser.add_argument(
             "--gravity",
             type=float,
-            default=20.0,
+            default=1.0,
             help="Gravity magnitude (positive); acceleration is -g along up_axis",
         )
         parser.add_argument(
