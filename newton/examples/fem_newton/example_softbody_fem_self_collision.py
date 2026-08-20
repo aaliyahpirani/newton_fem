@@ -4,9 +4,10 @@
 ###########################################################################
 # Example Softbody FEM Self Collision
 #
-# Experimental classic FEM Newton soft body. A soft arch stands inside the
-# solver's [-1, 1]^3 background grid and collapses under gravity onto the
-# ground so the two legs meet, exercising mesh self-collision contacts.
+# Experimental classic FEM Newton soft body. A hollow soft arch (outer walls
+# only) stands inside the solver's [-1, 1]^3 background grid and collapses
+# under gravity onto the ground so the two legs meet, exercising mesh
+# self-collision contacts.
 #
 # Command: uv run -m newton.examples softbody_fem_self_collision
 #
@@ -18,7 +19,7 @@ import newton
 import newton.examples
 
 
-def _add_soft_arch(
+def _add_soft_hollow_arch(
     builder: newton.ModelBuilder,
     *,
     pos: wp.vec3,
@@ -28,28 +29,46 @@ def _add_soft_arch(
     dim_z: int,
     arm_cells: int,
     top_cells: int,
+    wall_cells: int,
     density: float,
     k_mu: float,
     k_lambda: float,
     k_damp: float,
+    particle_radius: float | None = None,
 ) -> None:
-    """Add a voxelized soft arch (U on its side / inverted U) as tetrahedra.
+    """Add a voxelized hollow arch (inverted U, outer walls only) as tetrahedra.
 
-    Included cells form the left and right legs plus the top bridge. Each
-    included hex is split into 5 tets, matching :meth:`ModelBuilder.add_soft_grid`.
+    Included cells form the left and right legs plus the top bridge. Interior
+    cells of those members are skipped so the arch is a shell, not a solid
+    fill. Each included hex is split into 5 tets, matching
+    :meth:`ModelBuilder.add_soft_grid`.
     """
     mass = cell * cell * cell * density
 
     def cell_in_arch(x: int, y: int, z: int) -> bool:
-        del y
+        if x < 0 or x >= dim_x or y < 0 or y >= dim_y or z < 0 or z >= dim_z:
+            return False
         return x < arm_cells or x >= dim_x - arm_cells or z >= dim_z - top_cells
 
-    # Vertices touched by at least one arch cell.
+    def cell_on_shell(x: int, y: int, z: int) -> bool:
+        if not cell_in_arch(x, y, z):
+            return False
+        # Keep cells within wall_cells of the arch exterior (Chebyshev), matching
+        # the hollow-cube face test: interior of each member is empty.
+        for dz in range(-wall_cells, wall_cells + 1):
+            for dy in range(-wall_cells, wall_cells + 1):
+                for dx in range(-wall_cells, wall_cells + 1):
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+                    if not cell_in_arch(x + dx, y + dy, z + dz):
+                        return True
+        return False
+
     used: set[tuple[int, int, int]] = set()
     for z in range(dim_z):
         for y in range(dim_y):
             for x in range(dim_x):
-                if not cell_in_arch(x, y, z):
+                if not cell_on_shell(x, y, z):
                     continue
                 for dz in (0, 1):
                     for dy in (0, 1):
@@ -65,7 +84,7 @@ def _add_soft_arch(
                     continue
                 index_of[key] = builder.particle_count
                 p = pos + wp.vec3(ix * cell, iy * cell, iz * cell)
-                builder.add_particle(p, wp.vec3(0.0, 0.0, 0.0), mass)
+                builder.add_particle(p, wp.vec3(0.0, 0.0, 0.0), mass, radius=particle_radius)
 
     faces: dict[tuple[int, int, int], tuple[int, int, int]] = {}
 
@@ -86,7 +105,7 @@ def _add_soft_arch(
     for z in range(dim_z):
         for y in range(dim_y):
             for x in range(dim_x):
-                if not cell_in_arch(x, y, z):
+                if not cell_on_shell(x, y, z):
                     continue
                 v0 = index_of[(x, y, z)]
                 v1 = index_of[(x + 1, y, z)]
@@ -115,7 +134,7 @@ def _add_soft_arch(
 
 
 class Example:
-    """Collapse a soft arch so the legs self-collide with SolverFEMNewton."""
+    """Collapse a hollow soft arch so the legs self-collide with SolverFEMNewton."""
 
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -128,17 +147,19 @@ class Example:
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Soft arch inside [-1, 1]^3. Gap is narrow enough that the legs meet
+        # Hollow arch inside [-1, 1]^3. Members are thick enough to leave an
+        # empty interior; the gap is still narrow enough that the legs meet
         # as the bridge sags under gravity.
         cell = 0.08
-        dim_x, dim_y, dim_z = 10, 2, 7
-        arm_cells, top_cells = 2, 2
+        dim_x, dim_y, dim_z = 10, 6, 8
+        arm_cells, top_cells = 3, 3
+        wall_cells = 1
         extent_x = dim_x * cell
         extent_y = dim_y * cell
         # Sit slightly above the ground plane near the bottom of the FEM domain.
         z0 = -0.65
         ground_height = z0 - 0.02
-        _add_soft_arch(
+        _add_soft_hollow_arch(
             builder,
             pos=wp.vec3(-0.5 * extent_x, -0.5 * extent_y, z0),
             cell=cell,
@@ -147,10 +168,12 @@ class Example:
             dim_z=dim_z,
             arm_cells=arm_cells,
             top_cells=top_cells,
+            wall_cells=wall_cells,
             density=1.0,
             k_mu=1.0e2,
             k_lambda=1.0e2,
             k_damp=0.0,
+            particle_radius=args.collision_radius,
         )
 
         self.model = builder.finalize()
@@ -223,7 +246,7 @@ class Example:
         parser.add_argument(
             "--young-modulus",
             type=float,
-            default=150.0,
+            default=50.0,
             help="Young modulus [Pa] (keep soft so the arch collapses)",
         )
         parser.add_argument(

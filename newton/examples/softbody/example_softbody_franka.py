@@ -256,7 +256,7 @@ class Example:
         self.robot_key_poses = np.array(
             [
                 # approach: move above the duck
-                [2.5, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, gripper_open],
+                [2.5, -0.005, -0.5, 0.35, 1, 1.0, 0.0, 0.0, gripper_open],
                 # descend: lower to duck body
                 [2.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, gripper_open],
                 # pinch: close gripper on duck
@@ -266,11 +266,11 @@ class Example:
                 # hold: pause in air
                 [2.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, gripper_close],
                 # place: lower back to table
-                [2.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, gripper_close],
+                [2.0, -0.005, -0.5, 0.11, 1, 0.0, 0.0, 0.0, gripper_close],
                 # release: open gripper
-                [1.0, -0.005, -0.5, 0.21, 1, 0.0, 0.0, 0.0, gripper_open],
+                [1.0, -0.005, -0.5, 0.11, 1, 0.0, 0.0, 0.0, gripper_open],
                 # retract: move away
-                [2.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, gripper_open],
+                [1.0, -0.005, -0.5, 0.35, 1, 0.0, 0.0, 0.0, gripper_open],
             ],
             dtype=np.float32,
         )

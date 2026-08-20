@@ -123,7 +123,7 @@ class Example:
             "n_newton": args.newton_iters,
             "cg_iters": args.cg_iters,
             "y_min": -2.0,
-            "y_max": axis_max,
+            "y_max": 2.0,
             "quiet": True,
             "ground": False,
             "collision_stiffness": args.collision_stiffness,
