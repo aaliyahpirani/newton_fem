@@ -4,9 +4,9 @@
 ###########################################################################
 # Example Softbody FEM Hanging
 #
-# Experimental classic FEM Newton soft body. A soft cube sits inside the
-# solver's [-1, 1]^3 background grid; nodes above a Z clamp are fixed so the
-# cube hangs and sags under gravity onto a static box.
+# Experimental classic FEM Newton soft body. A hollow soft cube (outer walls
+# only) sits inside the solver's [-1, 1]^3 background grid and sags under
+# gravity onto a static box.
 #
 # By default a dynamic rigid sphere is coupled through SolverCoupledProxy:
 # CollisionPipeline detects particle-shape contacts, FEM applies the soft
@@ -28,8 +28,113 @@ import newton.examples
 from newton.solvers import SolverMuJoCo
 
 
+def _add_soft_hollow_cube(
+    builder: newton.ModelBuilder,
+    *,
+    pos: wp.vec3,
+    cell: float,
+    dim: int,
+    wall_cells: int,
+    density: float,
+    k_mu: float,
+    k_lambda: float,
+    k_damp: float,
+    particle_radius: float | None = None,
+) -> None:
+    """Add a voxelized hollow cube (outer walls only) as tetrahedra.
+
+    Interior cells are skipped so the cube is a shell, not a solid fill.
+    Each included hex is split into 5 tets, matching
+    :meth:`ModelBuilder.add_soft_grid`.
+    """
+    mass = cell * cell * cell * density
+
+    def cell_in_cube(x: int, y: int, z: int) -> bool:
+        return 0 <= x < dim and 0 <= y < dim and 0 <= z < dim
+
+    def cell_on_shell(x: int, y: int, z: int) -> bool:
+        if not cell_in_cube(x, y, z):
+            return False
+        return (
+            x < wall_cells
+            or x >= dim - wall_cells
+            or y < wall_cells
+            or y >= dim - wall_cells
+            or z < wall_cells
+            or z >= dim - wall_cells
+        )
+
+    used: set[tuple[int, int, int]] = set()
+    for z in range(dim):
+        for y in range(dim):
+            for x in range(dim):
+                if not cell_on_shell(x, y, z):
+                    continue
+                for dz in (0, 1):
+                    for dy in (0, 1):
+                        for dx in (0, 1):
+                            used.add((x + dx, y + dy, z + dz))
+
+    index_of: dict[tuple[int, int, int], int] = {}
+    for iz in range(dim + 1):
+        for iy in range(dim + 1):
+            for ix in range(dim + 1):
+                key = (ix, iy, iz)
+                if key not in used:
+                    continue
+                index_of[key] = builder.particle_count
+                p = pos + wp.vec3(ix * cell, iy * cell, iz * cell)
+                builder.add_particle(p, wp.vec3(0.0, 0.0, 0.0), mass, radius=particle_radius)
+
+    faces: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+
+    def add_face(i: int, j: int, k: int) -> None:
+        key = tuple(sorted((i, j, k)))
+        if key not in faces:
+            faces[key] = (i, j, k)
+        else:
+            del faces[key]
+
+    def add_tet(i: int, j: int, k: int, l: int) -> None:
+        builder.add_tetrahedron(i, j, k, l, k_mu, k_lambda, k_damp)
+        add_face(i, k, j)
+        add_face(j, k, l)
+        add_face(i, j, l)
+        add_face(i, l, k)
+
+    for z in range(dim):
+        for y in range(dim):
+            for x in range(dim):
+                if not cell_on_shell(x, y, z):
+                    continue
+                v0 = index_of[(x, y, z)]
+                v1 = index_of[(x + 1, y, z)]
+                v2 = index_of[(x + 1, y, z + 1)]
+                v3 = index_of[(x, y, z + 1)]
+                v4 = index_of[(x, y + 1, z)]
+                v5 = index_of[(x + 1, y + 1, z)]
+                v6 = index_of[(x + 1, y + 1, z + 1)]
+                v7 = index_of[(x, y + 1, z + 1)]
+
+                if (x & 1) ^ (y & 1) ^ (z & 1):
+                    add_tet(v0, v1, v4, v3)
+                    add_tet(v2, v3, v6, v1)
+                    add_tet(v5, v4, v1, v6)
+                    add_tet(v7, v6, v3, v4)
+                    add_tet(v4, v1, v6, v3)
+                else:
+                    add_tet(v1, v2, v5, v0)
+                    add_tet(v3, v0, v7, v2)
+                    add_tet(v4, v7, v0, v5)
+                    add_tet(v6, v5, v2, v7)
+                    add_tet(v5, v2, v7, v0)
+
+    for i, j, k in faces.values():
+        builder.add_triangle(i, j, k)
+
+
 class Example:
-    """Rest a soft cube on the ground with the experimental FEM Newton solver."""
+    """Rest a hollow soft cube on the ground with the experimental FEM Newton solver."""
 
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -45,9 +150,10 @@ class Example:
         # Match Newton viewer convention (Z up) with the FEM grid domain.
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
 
-        # Soft cube inside [-1, 1]^3. No Dirichlet clamp; it sits on the ground.
+        # Hollow cube inside [-1, 1]^3. No Dirichlet clamp; it sits on the ground.
         cell = 0.08  # edge length of one voxel
         dim = 8  # number of elements along each axis so it is 8x8x8 cells
+        wall_cells = 1  # outer-face thickness in voxels; interior is empty
         extent = dim * cell  # full side length of the cube
         # Match SolverFEMNewton's default collision_radius = 0.5 / resolution so
         # pipeline detection and the FEM penalty see the same particle size.
@@ -58,16 +164,12 @@ class Example:
 
         # Center in XY, a short drop above the ground plane.
         z0 = 0.04
-        builder.add_soft_grid(
+        _add_soft_hollow_cube(
+            builder,
             pos=wp.vec3(-0.5 * extent, -0.5 * extent, z0),
-            rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=dim,
-            dim_y=dim,
-            dim_z=dim,
-            cell_x=cell,
-            cell_y=cell,
-            cell_z=cell,
+            cell=cell,
+            dim=dim,
+            wall_cells=wall_cells,
             density=1.0,
             k_mu=1.0e2,
             k_lambda=1.0e2,
@@ -85,7 +187,7 @@ class Example:
             hz=0.05,
         )
 
-        sphere_radius = 0.12
+        sphere_radius = 0.06
         sphere_body = None
         sphere_joint = None
         if not self.fem_only:
@@ -116,7 +218,7 @@ class Example:
             "resolution": args.resolution,
             "up_axis": 2,
             "gravity": args.gravity,
-            "young_modulus": args.young_modulus,
+            "young_modulus": 200.0,
             "poisson_ratio": 0.1,
             "density": 1.0,
             "dt": self.sim_dt,

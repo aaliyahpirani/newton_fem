@@ -111,7 +111,7 @@ PYRAMID_TET_INDICES = np.array(
     ],
     dtype=np.int32,
 )
-
+# 18
 PYRAMID_PARTICLES = [
     (0.0, 0.0, 0.0),
     (1.0, 0.0, 0.0),
